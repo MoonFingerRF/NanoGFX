@@ -86,6 +86,13 @@ public:
 
   void setBrightness(uint8_t b) { writeReg(0x51, &b, 1); }
 
+  // Standard MIPI-DCS panel controls.
+  void displayOn()  { writeReg(0x29, NULL, 0); }
+  void displayOff() { writeReg(0x28, NULL, 0); }
+  void invert(bool on) { writeReg(on ? 0x21 : 0x20, NULL, 0); }
+  void sleep() { writeReg(0x28, NULL, 0); writeReg(0x10, NULL, 0); delay(5); }    // display off + sleep-in
+  void wake()  { writeReg(0x11, NULL, 0); delay(120); writeReg(0x29, NULL, 0); }  // sleep-out + display on
+
   // CASET/RASET/RAMWR with the module's panel offsets applied.
   void setAddrWindow(uint16_t xs, uint16_t ys, uint16_t xe, uint16_t ye) {
     xs += xOff; xe += xOff; ys += yOff; ye += yOff;

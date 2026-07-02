@@ -38,6 +38,11 @@ what a small MCU can drive:
     parity-aligned nibble mask built on the fly, blitted with whole-byte
     read-modify-writes — ~4–5× fewer operations per glyph than per-pixel drawing, at any
     x alignment and sizes 1–4. Byte-identical output to stock Adafruit_GFX (fuzz-proven).
+  - **Sprites & more**: canvas-to-canvas `blit`/`blitRect` with a transparent index
+    (memcpy rows when aligned, span emission from run-form rows), `drawIndexedBitmap`
+    for flash-resident 2 px/byte images, `vScroll` that scrolls by **moving line
+    records** (three memmoves, rows stay compressed), and a format-aware `getPixel`
+    that walks run-lists without disturbing them.
 - **`PackRLE`** — the codec. Encode from packed nibbles, 8-bit indices, or run-lists;
   decode to nibbles, 8-bit palette (with a 256-entry pair LUT: 2 px per lookup), or
   32-bit colors. Worst case = flat packed size, guaranteed.
@@ -101,7 +106,9 @@ void frame() {
 }
 ```
 
-See `examples/` for complete sketches, including the full ESP32-S3 AMOLED pipeline.
+See `examples/` for complete sketches, including the full ESP32-S3 AMOLED pipeline —
+and **[docs/API.md](docs/API.md) for the complete function reference** (every PackCanvas /
+PackRLE / PackFlush / RM690B0 call, plus the format contracts).
 
 ## Examples
 
@@ -111,6 +118,10 @@ See `examples/` for complete sketches, including the full ESP32-S3 AMOLED pipeli
   print each line's encoded size; scattered pixels demote exactly the lines they touch.
 - **`FastText_DualParity`** — the dual-parity text blitter vs the stock per-pixel path,
   timed side by side at sizes 1–4 and both parities.
+- **`Sprites_Blit`** — canvas sprites: transparent blits, sub-rect blits, flash-resident
+  packed images, and format-aware pixel reads.
+- **`ScrollingPlot`** — a live strip-chart on `vScroll`: scrolling moves line *records*
+  (microseconds for a full region) and the rows stay compressed.
 - **`RM690B0_DirtyPush`** (ESP32-S3) — the complete NanoPFD pipeline on a LilyGO T4-S3:
   dual-mode canvas → `encodeFrame` → `PackFlush` dirty bands → split-polling QSPI push,
   with per-frame stats printed (rows pushed, decode µs, wire µs).
