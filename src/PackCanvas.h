@@ -71,7 +71,11 @@ public:
 
   PackCanvas(uint16_t w, uint16_t h, bool allocate_buffer = true) : GFXcanvas8(w, h, allocate_buffer) {
     setRotationMatrix();
-    lineStride = (uint16_t)PRLE_STRIDE(w);
+    // Slot bytes per line, rounded EVEN: run-lists overlay the slot as uint16_t
+    // entries, so an odd PRLE_STRIDE (any w with w/2 odd, e.g. 450 -> 225) would
+    // put every odd row's list at a misaligned address — UB, and a real penalty
+    // on cores that trap or fix up unaligned halfword stores.
+    lineStride = (uint16_t)((PRLE_STRIDE(w) + 1) & ~1);
     effCap = (int)(lineStride / 2);        // never more entries than the slot holds
     if (effCap > RUN_CAP) effCap = RUN_CAP;
     if (w > NANO_MAX_W) effCap = 0;        // degenerate: permanent FLAT (still correct)
@@ -266,8 +270,16 @@ public:
   uint8_t textScale = 1;
   void setTextSize(uint8_t s) { GFXcanvas8::setTextSize((uint8_t)(s * textScale)); }
 
-  // Buffer bytes for a w*h canvas in the given format.
-  static size_t bufBytes(uint16_t w, uint16_t h, bool p4) { return p4 ? (((size_t)w * h + 1) >> 1) : ((size_t)w * h); }
+  // Buffer bytes for a w*h canvas in the given format. Packed canvases are laid
+  // out as per-line slots of lineSlotBytes() (PRLE_STRIDE rounded even), NOT as
+  // globally packed nibbles — size external buffers with THIS, and address rows
+  // via lineBytes()/lineSlotBytes(), never (y*w + x) >> 1.
+  static size_t bufBytes(uint16_t w, uint16_t h, bool p4) {
+    if (!p4) return (size_t)w * h;
+    return (size_t)h * ((PRLE_STRIDE(w) + 1) & ~1);
+  }
+  // Slot bytes per packed line (row y starts at rawBuffer() + y * lineSlotBytes()).
+  size_t lineSlotBytes() const { return lineStride; }
 
   // ---- raw-access + finalize API (see contract above) -----------------------
   // Force lines [y0, y1) to FLAT so their slot bytes are plain packed nibbles.
@@ -302,6 +314,185 @@ public:
   }
   bool lineIsRuns(int y) const { return packed4 && lineMode[y] == M_RUNS; }   // telemetry
   int  lineRuns(int y)   const { return (packed4 && lineMode[y] == M_RUNS) ? runCount[y] : 0; }
+
+  // ---- pixel read (format-aware, non-mutating) -------------------------------
+  // Palette index at (x, y). Packed RUNS lines are read by walking the run list —
+  // reading never explodes a line. The 8-bit path honours setRotation() exactly
+  // like GFXcanvas8::getPixel. Out of bounds -> 0.
+  uint8_t getPixel(int16_t x, int16_t y) const {
+    if (!packed4) {
+      if ((uint16_t)x >= (uint16_t)_width || (uint16_t)y >= (uint16_t)_height) return 0;
+      switch (rotation) {
+        case 1: { int16_t t = x; x = WIDTH - 1 - y; y = t; } break;
+        case 2: x = WIDTH - 1 - x; y = HEIGHT - 1 - y; break;
+        case 3: { int16_t t = x; x = y; y = HEIGHT - 1 - t; } break;
+      }
+      return buffer[(int32_t)y * WIDTH + x];
+    }
+    if ((uint16_t)x >= (uint16_t)WIDTH || (uint16_t)y >= (uint16_t)HEIGHT) return 0;
+    if (lineMode[y] == M_RUNS) {              // walk the run list: last run starting <= x
+      const uint16_t *e = (const uint16_t *)(buffer + (size_t)y * lineStride);
+      int n = runCount[y];
+      uint8_t c = (uint8_t)(e[0] & 0x0F);
+      for (int k = 1; k < n && (int)(e[k] >> 4) <= x; k++) c = (uint8_t)(e[k] & 0x0F);
+      return c;
+    }
+    uint8_t b = buffer[(size_t)y * lineStride + (x >> 1)];
+    return (x & 1) ? (uint8_t)(b & 0x0F) : (uint8_t)(b >> 4);
+  }
+
+  // ---- canvas-to-canvas blit (sprites) ---------------------------------------
+  // Copy the rect [sx, sy, w, h] of `src` onto this canvas at (dx, dy), optionally
+  // skipping one palette index as transparent (pass 0-15; -1 = opaque copy).
+  // NATIVE coordinates on both canvases: the rotation matrix and setRotation are
+  // deliberately ignored (same convention as sprite pushes in other libraries).
+  // Fast path: both canvases packed, opaque, and byte-aligned (even sx and dx) ->
+  // one memcpy per row. Everything else takes an exact per-nibble loop.
+  void blitRect(const PackCanvas &src, int16_t sx, int16_t sy, int16_t w, int16_t h,
+                int16_t dx, int16_t dy, int16_t transparent = -1) {
+    // clip against both canvases
+    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+    if (sx + w > src.WIDTH)  w = src.WIDTH  - sx;
+    if (sy + h > src.HEIGHT) h = src.HEIGHT - sy;
+    if (dx + w > WIDTH)  w = WIDTH  - dx;
+    if (dy + h > HEIGHT) h = HEIGHT - dy;
+    if (w <= 0 || h <= 0) return;
+    if (packed4 && src.packed4) {
+      flatten(dy, dy + h);                        // dual-mode targets go flat once
+      bool aligned = transparent < 0 && !(sx & 1) && !(dx & 1);
+      for (int16_t j = 0; j < h; j++) {
+        int syy = sy + j, dyy = dy + j;
+        uint8_t *drow = buffer + (size_t)dyy * lineStride;
+        if (src.lineMode[syy] == M_RUNS) {        // run-form source row: emit spans
+          const uint16_t *e = (const uint16_t *)(src.buffer + (size_t)syy * src.lineStride);
+          int n = src.runCount[syy];
+          for (int k = 0; k < n; k++) {
+            int rx = e[k] >> 4;
+            uint8_t c = (uint8_t)(e[k] & 0x0F);
+            int re = (k + 1 < n) ? (e[k + 1] >> 4) : src.WIDTH;
+            if (re <= sx || rx >= sx + w) continue;
+            if (rx < sx) rx = sx;
+            if (re > sx + w) re = sx + w;
+            if ((int16_t)c == transparent) continue;
+            nibSpan(drow, dx + (rx - sx), re - rx, c);   // native coords, flat target row
+          }
+          continue;
+        }
+        const uint8_t *srow = src.buffer + (size_t)syy * src.lineStride;
+        if (aligned) {                            // even-to-even: whole bytes
+          int bytes = w >> 1;
+          if (bytes) memcpy(drow + (dx >> 1), srow + (sx >> 1), (size_t)bytes);
+          if (w & 1) {                            // odd trailing pixel
+            uint8_t c = (uint8_t)(srow[(sx + w - 1) >> 1] >> 4);
+            uint8_t *p = drow + ((dx + w - 1) >> 1);
+            *p = (uint8_t)((*p & 0x0F) | (c << 4));
+          }
+          continue;
+        }
+        for (int16_t i = 0; i < w; i++) {         // exact general path
+          uint8_t b = srow[(sx + i) >> 1];
+          uint8_t c = ((sx + i) & 1) ? (uint8_t)(b & 0x0F) : (uint8_t)(b >> 4);
+          if ((int16_t)c == transparent) continue;
+          uint8_t *p = drow + ((dx + i) >> 1);
+          if ((dx + i) & 1) *p = (uint8_t)((*p & 0xF0) | c);
+          else              *p = (uint8_t)((*p & 0x0F) | (c << 4));
+        }
+      }
+      return;
+    }
+    // mixed / 8-bit formats: exact per-pixel copy in native coords
+    for (int16_t j = 0; j < h; j++)
+      for (int16_t i = 0; i < w; i++) {
+        uint8_t c = src.packed4 ? src.getPixel(sx + i, sy + j)
+                                : src.buffer[(int32_t)(sy + j) * src.WIDTH + (sx + i)];
+        if ((int16_t)c == transparent) continue;
+        if (packed4) pix4(dx + i, dy + j, c);
+        else buffer[(int32_t)(dy + j) * WIDTH + (dx + i)] = c;
+      }
+  }
+  // Whole-canvas convenience: blit all of `src` at (dx, dy).
+  void blit(const PackCanvas &src, int16_t dx, int16_t dy, int16_t transparent = -1) {
+    blitRect(src, 0, 0, src.WIDTH, src.HEIGHT, dx, dy, transparent);
+  }
+
+  // ---- packed 4-bit image draw ------------------------------------------------
+  // Draw a nibble-packed image (2 px/byte, row stride = (w+1)/2 bytes, high nibble
+  // first — the natural export of any indexed image) at (x, y), optionally with one
+  // transparent palette index. `data` may live in flash (read via pgm_read_byte).
+  // NATIVE coordinates; dual-mode target rows are flattened once.
+  void drawIndexedBitmap(int16_t x, int16_t y, const uint8_t *data, int16_t w, int16_t h,
+                         int16_t transparent = -1) {
+    if (!packed4) {                              // 8-bit canvas: unpack per pixel
+      for (int16_t j = 0; j < h; j++)
+        for (int16_t i = 0; i < w; i++) {
+          uint8_t b = pgm_read_byte(data + (size_t)j * ((w + 1) >> 1) + (i >> 1));
+          uint8_t c = (i & 1) ? (uint8_t)(b & 0x0F) : (uint8_t)(b >> 4);
+          if ((int16_t)c != transparent) fastDrawPixel(x + i, y + j, c);
+        }
+      return;
+    }
+    int16_t i0 = x < 0 ? -x : 0, j0 = y < 0 ? -y : 0;
+    int16_t i1 = (x + w > WIDTH)  ? WIDTH  - x : w;
+    int16_t j1 = (y + h > HEIGHT) ? HEIGHT - y : h;
+    if (i0 >= i1 || j0 >= j1) return;
+    flatten(y + j0, y + j1);
+    const size_t stride = (size_t)((w + 1) >> 1);
+    for (int16_t j = j0; j < j1; j++) {
+      const uint8_t *srow = data + (size_t)j * stride;
+      uint8_t *drow = buffer + (size_t)(y + j) * lineStride;
+      for (int16_t i = i0; i < i1; i++) {
+        uint8_t b = pgm_read_byte(srow + (i >> 1));
+        uint8_t c = (i & 1) ? (uint8_t)(b & 0x0F) : (uint8_t)(b >> 4);
+        if ((int16_t)c == transparent) continue;
+        uint8_t *p = drow + ((x + i) >> 1);
+        if ((x + i) & 1) *p = (uint8_t)((*p & 0xF0) | c);
+        else             *p = (uint8_t)((*p & 0x0F) | (c << 4));
+      }
+    }
+  }
+
+  // ---- vertical scroll ---------------------------------------------------------
+  // Scroll rows [y0, y0+h) by dy pixels (dy > 0 = down, dy < 0 = up); vacated rows
+  // are filled with `fill`. On a packed canvas each row is a self-contained record
+  // (slot + mode + run count), so the scroll MOVES LINE RECORDS — memmove of the
+  // slots plus their metadata, no per-pixel work, and run-form rows stay run-form.
+  // NATIVE row coordinates (unaffected by rotation / the matrix).
+  void vScroll(int16_t y0, int16_t h, int16_t dy, uint8_t fill) {
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (y0 + h > HEIGHT) h = HEIGHT - y0;
+    if (h <= 0 || dy == 0) return;
+    int16_t ady = dy < 0 ? -dy : dy;
+    if (ady > h) ady = h;                       // whole region vacated (native fill below)
+    int16_t keep = h - ady;
+    int16_t srcY = (dy > 0) ? y0 : y0 + ady;    // content source rows
+    int16_t dstY = (dy > 0) ? y0 + ady : y0;
+    if (!packed4) {
+      if (keep) memmove(buffer + (int32_t)dstY * WIDTH, buffer + (int32_t)srcY * WIDTH,
+                        (size_t)keep * WIDTH);
+      memset(buffer + (int32_t)(dy > 0 ? y0 : y0 + keep) * WIDTH, fill, (size_t)ady * WIDTH);
+      return;
+    }
+    if (keep) {
+      memmove(buffer + (size_t)dstY * lineStride, buffer + (size_t)srcY * lineStride,
+              (size_t)keep * lineStride);
+      memmove(lineMode + dstY,   lineMode + srcY,   (size_t)keep);
+      memmove(stickyFlat + dstY, stickyFlat + srcY, (size_t)keep);
+      memmove(runCount + dstY,   runCount + srcY,   (size_t)keep * sizeof(uint16_t));
+    }
+    int16_t vac = dy > 0 ? y0 : y0 + keep;      // vacated rows: one run each (or memset)
+    for (int16_t yv = vac; yv < vac + ady; yv++) {
+      if (dualMode && effCap >= 1) {
+        lineMode[yv] = M_RUNS; runCount[yv] = 1;
+        ((uint16_t *)(buffer + (size_t)yv * lineStride))[0] = (uint16_t)(fill & 0x0F);
+      } else {
+        memset(buffer + (size_t)yv * lineStride, (uint8_t)((fill << 4) | (fill & 0x0F)), lineStride);
+        lineMode[yv] = M_FLAT;
+      }
+    }
+  }
   // Read-only line access for compositors/encoders that want to consume run-lists
   // DIRECTLY (e.g. an RGB565 composite that fills each run once instead of doing a
   // per-byte LUT walk). Returns the run count and points *e at the entries while the
@@ -367,6 +558,16 @@ private:
 
   inline uint8_t  *slot(int y)   { return buffer + (size_t)y * lineStride; }
   inline uint16_t *runsOf(int y) { return (uint16_t *)slot(y); }   // even stride: 2-aligned
+
+  // Fill len nibbles of color c at nibble offset x in a FLAT row: odd lead nibble,
+  // whole-byte memset, even tail nibble (the same shape as drawFastHLine's flat path).
+  static inline void nibSpan(uint8_t *row, int x, int len, uint8_t c) {
+    if (len <= 0) return;
+    if (x & 1) { uint8_t *p = row + (x >> 1); *p = (uint8_t)((*p & 0xF0) | c); x++; len--; }
+    int bytes = len >> 1;
+    if (bytes) { memset(row + (x >> 1), (uint8_t)((c << 4) | c), (size_t)bytes); x += bytes * 2; len -= bytes * 2; }
+    if (len == 1) { uint8_t *p = row + (x >> 1); *p = (uint8_t)((*p & 0x0F) | (c << 4)); }
+  }
 
   // Single in-bounds packed4 pixel write. With dualMode off every line is FLAT, so
   // this is the original nibble RMW plus one predictable branch. A pixel landing on
