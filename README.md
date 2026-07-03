@@ -54,6 +54,12 @@ what a small MCU can drive:
   polling transfer**: the SPI DMA shifts chunk *n* out while your CPU decodes chunk
   *n+1* — the transfer time hides under compute without the interrupt-driven queued
   path (which some panels, including this one, cannot sustain).
+- **`ST7789`** (ESP32) — the same driver shape for classic 4-wire-SPI TFTs
+  (240×240/280/320 modules), with the same split-polling overlap and explicit
+  per-rotation window origins. RGB *parallel* panels (LCD_CAM framebuffers) need no
+  driver at all: PackFlush + `prle_decode_lut32` decode dirty rows straight into the
+  scanned framebuffer — that's how NanoPFD runs all three of its panel types on one
+  pipeline.
 
 Measured on NanoPFD's ESP32-S3 @ 240 MHz, 450×600 @ 8 bpp wire format, radios live:
 
