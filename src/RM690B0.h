@@ -17,6 +17,10 @@
 //     wire time vs RGB565; pass your MADCTL/offsets for the module's mounting.
 //   - GPIO-matrix routed pins cap the effective clock near 40 MHz; requesting
 //     80 MHz is clean and yields ~40 effective.
+//   - PARTIAL-UPDATE WINDOWS MUST BE EVEN-ALIGNED (even start row/col, odd end):
+//     odd-aligned RASET/CASET are rounded inside the controller and the write
+//     lands one pixel off — dirty-band pushes must widen bands to even bounds
+//     (hardware-observed as a +-1 px full-image wobble).
 //
 //  Dependencies: esp-idf spi_master + Arduino GPIO. No display library needed.
 //  Part of NanoGFX (https://github.com/MoonFingerRF/NanoGFX); MIT license.
