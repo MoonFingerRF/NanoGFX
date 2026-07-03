@@ -8,7 +8,7 @@ Complete reference for every public function in the library. One include gets th
 ```
 
 Contents: [PackCanvas](#packcanvas) · [PackRLE](#packrle) · [PackFlush](#packflush) ·
-[RM690B0](#rm690b0) · [Formats & contracts](#formats--contracts)
+[RM690B0](#rm690b0) · [ST7789](#st7789) · [Formats & contracts](#formats--contracts)
 
 ---
 
@@ -199,6 +199,33 @@ flush.flush(comp, lens, 8, [&](int y0, int y1) {
   if (inflight) amo.ramWriteEnd();
   amo.ramEnd();
 });
+```
+
+---
+
+## ST7789
+
+Minimal ESP32 4-wire-SPI driver for ST7789-class TFTs (`ST7789.h`, ESP32 only) —
+the same shape as RM690B0, so the flush pipeline code is identical across panels.
+Manual CS + manual DC; polling transfers with the split-polling overlap.
+
+| Function | Description |
+|---|---|
+| `bool begin(spi_host_device_t host, const Pins &p, uint32_t clockHz, uint32_t maxTransferBytes, bool ips = true)` | Bus + panel init. `Pins{dc,cs,sck,mosi,rst,bl}` (`rst`/`bl` < 0 = none). IPS modules (the common case) need inversion on — that's the `ips` default. One panel per SPI host; two panels on separate hosts flush fully in parallel. |
+| `void setRotation(uint8_t r, uint16_t offX, uint16_t offY)` | MADCTL quarter-turn (rot0 `0x00`, rot1 `0x60`, rot2 `0xC0`, rot3 `0xA0`) plus this rotation's **explicit** window origin — modules smaller than the 240×320 GRAM sit at rotation-dependent origins (a 240×280: `(0,20)` at rot 0/2, `(20,0)` at rot 1/3), so the caller passes the known-good pair. |
+| `void setAddrWindow(uint16_t xs, uint16_t ys, uint16_t xe, uint16_t ye)` | CASET/RASET with the rotation's offsets applied. |
+| `void ramBegin()` / `void ramEnd()` | Issue RAMWR and hold CS/DC for the burst / release. |
+| `void ramWrite(const uint8_t *buf, uint32_t bytes)` | Blocking pixel write, RGB565 in **wire order** (big-endian — bake the byte swap into your `prle_decode_lut32` pair LUT so decoded rows are wire-ready). |
+| `void ramWriteStart(...)` / `void ramWriteEnd()` | Split-polling overlap, exactly as in RM690B0: start the transfer, decode the next chunk into the other bounce half, then end. |
+| `void writeCmd(uint8_t cmd, const uint8_t *data = nullptr, uint32_t len = 0)` | Raw DCS command. |
+| `displayOn/Off`, `invert(bool)`, `sleep()`, `wake()`, `backlight(bool)` | Standard controls. After `wake()` call `PackFlush::invalidate()`. |
+
+RGB565 pair LUT for SPI panels (wire order) vs RGB parallel framebuffers (native):
+
+```cpp
+// SPI (ST7789):  word = swap16(pal[hi]) | swap16(pal[lo]) << 16   -> bytes are wire-ready
+// RGB fb (LCD_CAM): word =        pal[hi] |        pal[lo] << 16   -> aligned fb stores
+for (int b = 0; b < 256; b++) pair[b] = f(pal[b >> 4]) | (uint32_t)f(pal[b & 15]) << 16;
 ```
 
 ---
