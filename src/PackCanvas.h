@@ -90,9 +90,21 @@ public:
 
   float rotA, rotB, offX, offY;
   bool  identity;
+  // The rotation transform is INTEGER 16.16 affine: tx = (A*x - B*y + CX) >> 16,
+  // ty = (A*y + B*x + CY) >> 16, with the rounding bias folded into CX/CY — four
+  // 32-bit multiplies per pixel instead of four float multiplies + two float->int
+  // conversions (2-3x faster rotated pixels: compass roses, rotated labels).
+  // |A|,|B| <= 65536 and inputs are guarded to |x|,|y| < 8192, so every term fits
+  // 32 bits. Rounds to nearest (the old float path truncated — rotated pixels may
+  // land one pixel differently than historical output; visually identical).
+  int32_t rotAF = 65536, rotBF = 0, rotCXF = 32768, rotCYF = 32768;
   void setRotationMatrix(float angle = 0, float x = 0, float y = 0) {
     rotA = cosf(angle); rotB = sinf(angle); offX = x; offY = y;
     identity = (angle == 0.0f && x == 0.0f && y == 0.0f);
+    rotAF  = (int32_t)lrintf(rotA * 65536.0f);
+    rotBF  = (int32_t)lrintf(rotB * 65536.0f);
+    rotCXF = (int32_t)lrintf((offX - rotA * offX + rotB * offY) * 65536.0f) + 32768;
+    rotCYF = (int32_t)lrintf((offY - rotA * offY - rotB * offX) * 65536.0f) + 32768;
   }
 
   // 4-bit "fast drawPixel": clipped, unrotated; mode-dispatched in dual-mode.
@@ -116,9 +128,9 @@ public:
   }
   void drawPixel(int16_t x, int16_t y, uint16_t color) {
     if (!identity) {                                          // compass rotation matrix
-      float x_ = x - offX, y_ = y - offY;
-      int16_t tx = (int16_t)(rotA * x_ - rotB * y_ + offX);
-      int16_t ty = (int16_t)(rotA * y_ + rotB * x_ + offY);
+      if ((uint16_t)(x + 8192) > 16383 || (uint16_t)(y + 8192) > 16383) return;   // 16.16 range guard
+      int16_t tx = (int16_t)((rotAF * x - rotBF * y + rotCXF) >> 16);
+      int16_t ty = (int16_t)((rotAF * y + rotBF * x + rotCYF) >> 16);
       if (packed4) {                                          // packed = native coords
         if ((uint16_t)tx >= (uint16_t)WIDTH || (uint16_t)ty >= (uint16_t)HEIGHT) return;
         pix4(tx, ty, (uint8_t)color);
@@ -301,19 +313,103 @@ public:
   // comp + (y-y0)*stride with lengths in lineLen[y-y0]. RUNS lines cost O(runs)
   // (the draw already did the compression); FLAT lines take the word-at-a-time
   // scan. Every length <= PRLE_STRIDE(W) by the codec's proven bound.
-  void encodeFrame(uint8_t *comp, uint16_t *lineLen, size_t stride, int y0, int y1) {
+  void encodeFrame(uint8_t *comp, uint16_t *lineLen, size_t stride, int y0, int y1,
+                   uint32_t *lineHash = nullptr) {
     if (!packed4) return;
     if (y0 < 0) y0 = 0;
     if (y1 > HEIGHT) y1 = HEIGHT;
     for (int y = y0; y < y1; y++) {
       uint8_t *dst = comp + (size_t)(y - y0) * stride;
-      lineLen[y - y0] = (uint16_t)((lineMode[y] == M_RUNS)
+      uint16_t n = (uint16_t)((lineMode[y] == M_RUNS)
                           ? prle_encode_runs(runsOf(y), runCount[y], WIDTH, dst)
                           : prle_encode_flat(slot(y), WIDTH, dst));
+      lineLen[y - y0] = n;
+      // Optional per-line FNV-1a over the just-written stream (still in cache):
+      // with PackFlush's hashed mode, frame diffing becomes integer compares —
+      // no glass byte copy, no memcmp of PSRAM at all.
+      if (lineHash) {
+        uint32_t h = 2166136261u;
+        for (uint16_t i = 0; i < n; i++) { h ^= dst[i]; h *= 16777619u; }
+        lineHash[y - y0] = h;
+      }
     }
   }
+  // ---- canvas template snapshot/restore ---------------------------------------
+  // Capture the full canvas state — pixels AND the dual-mode per-line metadata —
+  // so a pre-rendered "template" (static chrome) can be restored each frame with
+  // row-aware memcpys instead of redrawing it. Buffer layout: [slots h*stride]
+  // [lineMode h][runCount 2h]. Row-aware: RUNS rows copy only their run entries.
+  // (stickyFlat is deliberately untouched: it only matters to fillScreen, which a
+  // template restore replaces.) Size dst with snapshotBytes().
+  size_t snapshotBytes() const { return (size_t)HEIGHT * lineStride + (size_t)HEIGHT * 3; }
+  void snapshot(uint8_t *dst) const {
+    uint8_t  *sm = dst + (size_t)HEIGHT * lineStride;
+    uint16_t *sc = (uint16_t *)(sm + HEIGHT);
+    memcpy(sm, lineMode, HEIGHT);
+    memcpy(sc, runCount, (size_t)HEIGHT * sizeof(uint16_t));
+    for (int y = 0; y < HEIGHT; y++) {
+      size_t n = (packed4 && lineMode[y] == M_RUNS) ? (size_t)runCount[y] * 2 : lineStride;
+      memcpy(dst + (size_t)y * lineStride, buffer + (size_t)y * lineStride, n);
+    }
+  }
+  void restore(const uint8_t *src) {
+    const uint8_t  *sm = src + (size_t)HEIGHT * lineStride;
+    const uint16_t *sc = (const uint16_t *)(sm + HEIGHT);
+    memcpy(lineMode, sm, HEIGHT);
+    memcpy(runCount, sc, (size_t)HEIGHT * sizeof(uint16_t));
+    for (int y = 0; y < HEIGHT; y++) {
+      size_t n = (packed4 && lineMode[y] == M_RUNS) ? (size_t)runCount[y] * 2 : lineStride;
+      memcpy(buffer + (size_t)y * lineStride, src + (size_t)y * lineStride, n);
+    }
+  }
+
   bool lineIsRuns(int y) const { return packed4 && lineMode[y] == M_RUNS; }   // telemetry
   int  lineRuns(int y)   const { return (packed4 && lineMode[y] == M_RUNS) ? runCount[y] : 0; }
+
+  // ---- fast diagonal lines ----------------------------------------------------
+  // Adafruit's drawLine walks the Bresenham through a VIRTUAL writePixel per pixel.
+  // This override produces the IDENTICAL pixel set (same steep/swap/error algorithm)
+  // but batches it: shallow segments emit one horizontal SPAN per row (whole-byte
+  // fills via nibSpan), steep segments emit strided nibble columns — no virtual
+  // dispatch anywhere. Engages for identity canvases at rotation 0 (packed or
+  // 8-bit); H/V degenerate lines route to the drawFast* primitives exactly like the
+  // base class. `fastLine=false` forces the stock chain (the fuzz suite's oracle).
+  bool fastLine = true;
+  void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color) {
+    if (!fastLine || !identity || (!packed4 && rotation != 0)) {
+      Adafruit_GFX::drawLine(x0, y0, x1, y1, color);
+      return;
+    }
+    if (x0 == x1) {                                  // vertical (base-class semantics)
+      if (y0 > y1) { int16_t t = y0; y0 = y1; y1 = t; }
+      drawFastVLine(x0, y0, (int16_t)(y1 - y0 + 1), color);
+      return;
+    }
+    if (y0 == y1) {                                  // horizontal
+      if (x0 > x1) { int16_t t = x0; x0 = x1; x1 = t; }
+      drawFastHLine(x0, y0, (int16_t)(x1 - x0 + 1), color);
+      return;
+    }
+    int16_t adx = (int16_t)(x1 > x0 ? x1 - x0 : x0 - x1);
+    int16_t ady = (int16_t)(y1 > y0 ? y1 - y0 : y0 - y1);
+    bool steep = ady > adx;
+    if (steep) { int16_t t = x0; x0 = y0; y0 = t; t = x1; x1 = y1; y1 = t; }
+    if (x0 > x1) { int16_t t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+    int16_t dx = (int16_t)(x1 - x0), dy = (int16_t)(y1 > y0 ? y1 - y0 : y0 - y1);
+    int16_t err = (int16_t)(dx / 2), ystep = (int16_t)(y0 < y1 ? 1 : -1);
+    // Walk runs: consecutive steps sharing y0 (the minor axis holds) form one run.
+    int16_t rs = x0;                                 // run start (major axis)
+    for (int16_t x = x0; x <= x1; x++) {
+      err -= dy;
+      bool bump = (err < 0) || (x == x1);
+      if (!bump) continue;
+      int16_t re = x;                                // run [rs, re] at minor coord y0
+      if (steep) emitVRun(y0, rs, (int16_t)(re - rs + 1), (uint8_t)color);   // px = (y0, rs..re)
+      else       emitHRun(rs, y0, (int16_t)(re - rs + 1), (uint8_t)color);   // px = (rs..re, y0)
+      if (err < 0) { y0 += ystep; err += dx; }
+      rs = (int16_t)(x + 1);
+    }
+  }
 
   // ---- pixel read (format-aware, non-mutating) -------------------------------
   // Palette index at (x, y). Packed RUNS lines are read by walking the run list —
@@ -558,6 +654,38 @@ private:
 
   inline uint8_t  *slot(int y)   { return buffer + (size_t)y * lineStride; }
   inline uint16_t *runsOf(int y) { return (uint16_t *)slot(y); }   // even stride: 2-aligned
+
+  // Clipped horizontal run at (x, y): whole-byte span on packed rows (dual rows
+  // explode on touch — a diagonal is scattered content), plain memset on 8-bit.
+  void emitHRun(int16_t x, int16_t y, int16_t w, uint8_t c) {
+    if ((uint16_t)y >= (uint16_t)HEIGHT) return;
+    if (x < 0) { w = (int16_t)(w + x); x = 0; }
+    if (x + w > WIDTH) w = (int16_t)(WIDTH - x);
+    if (w <= 0) return;
+    if (!packed4) { memset(buffer + (int32_t)y * WIDTH + x, c, (size_t)w); return; }
+    if (lineMode[y] != M_FLAT) explodeTo(y, runsOf(y), runCount[y]);
+    nibSpan(slot(y), x, w, (uint8_t)(c & 0x0F));
+  }
+  // Clipped vertical run at column x, rows [y, y+h): strided nibble/byte stores.
+  void emitVRun(int16_t x, int16_t y, int16_t h, uint8_t c) {
+    if ((uint16_t)x >= (uint16_t)WIDTH) return;
+    if (y < 0) { h = (int16_t)(h + y); y = 0; }
+    if (y + h > HEIGHT) h = (int16_t)(HEIGHT - y);
+    if (h <= 0) return;
+    if (!packed4) {
+      uint8_t *p = buffer + (int32_t)y * WIDTH + x;
+      for (int16_t i = 0; i < h; i++) { *p = c; p += WIDTH; }
+      return;
+    }
+    uint8_t cc = (uint8_t)(c & 0x0F);
+    for (int16_t i = 0; i < h; i++) {
+      int yy = y + i;
+      if (lineMode[yy] != M_FLAT) explodeTo(yy, runsOf(yy), runCount[yy]);
+      uint8_t *p = slot(yy) + (x >> 1);
+      if (x & 1) *p = (uint8_t)((*p & 0xF0) | cc);
+      else       *p = (uint8_t)((*p & 0x0F) | (cc << 4));
+    }
+  }
 
   // Fill len nibbles of color c at nibble offset x in a FLAT row: odd lead nibble,
   // whole-byte memset, even tail nibble (the same shape as drawFastHLine's flat path).

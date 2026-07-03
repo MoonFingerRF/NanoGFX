@@ -396,6 +396,51 @@ static inline bool prle_decode_lut32(const uint8_t *enc, size_t nb, int w, uint3
   return true;
 }
 
+// -> 12-bit RGB444 pairs (SPI panels in COLMOD 0x53): TWO pixels pack into exactly
+// THREE wire bytes — px0[11:4], px0[3:0]|px1[11:8], px1[7:0] — so a 15-color
+// palette (4 bits/channel) crosses the wire 25% cheaper than RGB565 with no
+// visible loss. p3Lut[256] holds each packed byte's 3 wire bytes in the LOW 24
+// bits of a uint32 (little-endian: byte0 in bits 0-7); the decoder writes 4-byte
+// stores advancing 3 bytes, so `out` must have ONE spare byte past the 3*ceil(w/2)
+// payload (size bounce buffers +4). Same stream semantics/rejection as the other
+// decoders; odd-W pad nibble contributes color 0.
+static inline bool prle_decode_p3(const uint8_t *enc, size_t nb, int w, uint8_t *out,
+                                  const uint32_t p3Lut[256]) {
+  size_t k = 0, kmax = nb * 2;
+  int px = 0;
+  uint8_t hi = 0;                                       // pending high nibble (px even)
+  uint8_t *o = out;
+  while (px < w) {
+    if (k >= kmax) return false;
+    uint8_t v = prle__rn(enc, k++);
+    int n = 1;
+    if (v == 0xF) {
+      if (k + 4 > kmax) return false;
+      v = prle__rn(enc, k++);
+      if (v == 0xF) return false;
+      n = ((int)prle__rn(enc, k) << 8) | ((int)prle__rn(enc, k + 1) << 4) | prle__rn(enc, k + 2);
+      k += 3;
+      if (n == 0 || px + n > w) return false;
+    }
+    if (px & 1) {                                       // complete the pending pair
+      uint32_t val = p3Lut[hi | v];
+      o[0] = (uint8_t)val; o[1] = (uint8_t)(val >> 8); o[2] = (uint8_t)(val >> 16);
+      o += 3; px++; n--;
+    }
+    if (n >= 2) {                                       // whole pairs: 4B store, 3B advance
+      uint32_t val = p3Lut[(v << 4) | v];
+      for (int t = n >> 1; t; t--) { memcpy(o, &val, 4); o += 3; }
+      px += n & ~1; n &= 1;
+    }
+    if (n) { hi = (uint8_t)(v << 4); px++; }            // dangling high nibble
+  }
+  if (w & 1) {                                          // pad low nibble = 0
+    uint32_t val = p3Lut[hi];
+    o[0] = (uint8_t)val; o[1] = (uint8_t)(val >> 8); o[2] = (uint8_t)(val >> 16);
+  }
+  return true;
+}
+
 #ifdef __XTENSA__
 #pragma GCC pop_options
 #endif

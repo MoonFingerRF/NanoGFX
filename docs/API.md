@@ -53,6 +53,7 @@ canvases and the rotation matrix when set; packed canvases are native/rotation-0
 | `void drawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t color)` | Vertical span. Run-form lines take a 1-px splice per row (verticals through clean bands keep those rows compressed). |
 | `void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color)` | **Row-major** (one `drawFastHLine` per row): a memset or single splice per row instead of Adafruit's per-column loop. Degenerate/negative spans delegate to the base for bit-exact legacy semantics. |
 | `void fillScreen(uint16_t color)` | 8-bit: one `memset`. Packed: whole-buffer `memset`. Dual-mode: **one run per line, O(H)** — no pixel writes at all (plus the sticky-flat frame policy, see below). |
+| `void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color)` | Span-batched Bresenham producing the **identical pixel set** to Adafruit's, without a virtual call per pixel: shallow segments emit one horizontal span per row, steep segments emit strided columns. Engages on identity canvases (packed, or 8-bit at rotation 0); `fastLine = false` forces the stock chain (fuzz oracle). |
 | `uint8_t getPixel(int16_t x, int16_t y) const` | Format-aware read. Packed run-form lines are read by **walking the run-list — reading never explodes a line**. 8-bit honours `setRotation` exactly like `GFXcanvas8`. Out of bounds → 0. |
 
 ### Sprites, images, scrolling
@@ -80,7 +81,7 @@ ignored — the same convention as sprite pushes in TFT_eSPI/LovyanGFX).
 
 | Function | Behavior |
 |---|---|
-| `void setRotationMatrix(float angle = 0, float x = 0, float y = 0)` | Rotate subsequent draws by `angle` (radians) about `(x, y)` — for compass cards / rotated instruments. Call with no arguments to return to identity. Works on every format. `drawFastH/VLine` under a matrix decompose to rotated pixels. |
+| `void setRotationMatrix(float angle = 0, float x = 0, float y = 0)` | Rotate subsequent draws by `angle` (radians) about `(x, y)` — for compass cards / rotated instruments. Call with no arguments to return to identity. Works on every format. The per-pixel transform is a precomputed **integer 16.16 affine** (four 32-bit multiplies — 2-3× faster than the float form it replaced; rounds to nearest; inputs bounded to ±8191). `drawFastH/VLine` under a matrix decompose to rotated pixels. |
 | `bool identity` | True when no matrix rotation is active (read-only in practice). |
 | `setRotation(r)` *(inherited)* | Quarter-turn logical rotation — supported on **8-bit** instances (fast paths included). Packed instances are native-orientation by contract; rotate at the panel instead (MADCTL). |
 
@@ -88,11 +89,12 @@ ignored — the same convention as sprite pushes in TFT_eSPI/LovyanGFX).
 
 | Function | Behavior |
 |---|---|
-| `void encodeFrame(uint8_t *comp, uint16_t *lineLen, size_t stride, int y0, int y1)` | Encode lines `[y0, y1)` as PackRLE streams into region-relative fixed slots (`comp + (y-y0)*stride`, length in `lineLen[y-y0]`). Run-form lines emit via `prle_encode_runs` — **no pixel scan; the drawing already did the compression**. Every length ≤ `PRLE_STRIDE(W)`, guaranteed. |
+| `void encodeFrame(uint8_t *comp, uint16_t *lineLen, size_t stride, int y0, int y1, uint32_t *lineHash = nullptr)` | Encode lines `[y0, y1)` as PackRLE streams into region-relative fixed slots (`comp + (y-y0)*stride`, length in `lineLen[y-y0]`). Run-form lines emit via `prle_encode_runs` — **no pixel scan; the drawing already did the compression**. Every length ≤ `PRLE_STRIDE(W)`, guaranteed. Pass `lineHash` to also get a per-line FNV-1a of the stream (near-free — bytes are still in cache) for `PackFlush::flushHashed`. |
 | `void flatten(int y0, int y1)` | Force lines `[y0, y1)` to flat so their slot bytes are plain packed nibbles — **required before poking/reading rows via `rawBuffer()`**. |
 | `uint8_t *rawBuffer()` | The buffer, no flattening — only for code that flattened its rows first. |
 | `uint8_t *getBuffer()` | Whole-canvas raw access: flattens everything first (then byte-identical to a plain packed canvas). |
 | `const uint8_t *lineBytes(int y) const` | Pointer to row `y`'s slot bytes (valid as flat nibbles only while the line is flat). |
+| `size_t snapshotBytes()` / `void snapshot(uint8_t *dst)` / `void restore(const uint8_t *src)` | Capture/restore the FULL canvas state — pixels and the dual-mode per-line metadata — with row-aware copies (run-form rows copy only their entries). For pre-rendered static **templates**: render chrome once, `snapshot()`, then `restore()` each frame instead of redrawing. `stickyFlat` is deliberately untouched (only `fillScreen` reads it, which a template replaces). |
 | `int lineRunList(int y, const uint16_t **e) const` | While row `y` is run-form: run count, with `*e` pointed at the entries (`(x_start << 4) \| color`; a run ends at the next entry's x, the last at `W`). Returns -1 when flat (read `lineBytes()` instead). For compositors that consume runs directly. |
 | `bool lineIsRuns(int y) const` / `int lineRuns(int y) const` | Telemetry: is row `y` run-form / how many runs. |
 
@@ -132,6 +134,7 @@ Stream format: nibbles `0x0–0xE` are literal pixels; `0xF` escapes to
 | `bool prle_decode_lut8(const uint8_t *enc, size_t nb, int w, uint8_t *out, const uint8_t lut[16])` | Decode to 1 byte/px through a palette LUT — runs become `memset`s. |
 | `bool prle_decode_lut8p(const uint8_t *enc, size_t nb, int w, uint8_t *out, const uint8_t lut[16], const uint16_t lutPair[256])` | Same, plus a 256-entry **pair LUT** so literal bytes convert **2 px per lookup**. The fast path for 8-bpp panels (build `lutPair[b] = lut[b>>4] \| (lut[b&15] << 8)`). |
 | `bool prle_decode_lut32(const uint8_t *enc, size_t nb, int w, uint32_t *out, const uint32_t lut[16])` | Decode to 32-bit colors (RGB888/canvas previews). |
+| `bool prle_decode_p3(const uint8_t *enc, size_t nb, int w, uint8_t *out, const uint32_t p3Lut[256])` | Decode to **RGB444 wire triplets** (2 px → exactly 3 bytes; COLMOD `0x53` on ST7789-class panels): 25% less wire time, lossless for a 15-color palette. `out` needs one spare byte past the payload (size bounce buffers +4). |
 
 Compile with `-DPRLE_TEST_MAIN` to build the codec's standalone self-test.
 
@@ -150,6 +153,7 @@ and pushes only coalesced bands of changed rows. For any panel with persistent G
 |---|---|
 | `void begin(uint8_t *glass, uint16_t *glassLen, int height, size_t slot)` | Attach caller-owned glass buffers: `height*slot` bytes + `height` lengths (put them in PSRAM on ESP32). `slot` must match the stride passed to `encodeFrame`. |
 | `int flush(const uint8_t *comp, const uint16_t *lineLen, int gap, PushBand pushBand)` | Flush one frame. `pushBand(y0, y1)` (any callable) must write rows `[y0, y1]` to the panel — set the window, decode, send. `gap` = clean rows absorbed into a band rather than paying a window switch (4–16 typical). Returns rows pushed. First flush after `begin()`/`invalidate()` pushes the full frame and adopts it. |
+| `void beginHashed(uint32_t *glassHash, uint16_t *glassLen, int height)` / `int flushHashed(const uint16_t *lineLen, const uint32_t *lineHash, int gap, PushBand)` | **Hashed mode**: the on-glass state is each row's (length, FNV-1a) pair from `encodeFrame(..., lineHash)` — no glass byte copy, no memcmp; dirty testing is two integer compares per row. A changed row is wrongly skipped only on a same-length hash collision (~2⁻³² per changed row) and self-heals on its next change. |
 | `void invalidate()` | Force the next flush to push everything. Call when identical encoded bytes would no longer decode to identical pixels: **decode-palette changes, panel re-init/GRAM loss.** |
 
 The glass copy updates only for rows actually pushed, so bookkeeping stays exact across

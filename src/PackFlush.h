@@ -34,6 +34,15 @@ public:
   void begin(uint8_t *glass, uint16_t *glassLen, int height, size_t slot) {
     g = glass; gl = glassLen; h = height; sl = slot; valid = false;
   }
+  // HASHED mode: no glass byte copy at all — the on-glass state is each row's
+  // (length, hash) pair, produced as a near-free byproduct of encodeFrame(...,
+  // lineHash). Dirty testing becomes two integer compares per row instead of a
+  // memcmp of (typically PSRAM-resident) stream bytes. A row is wrongly skipped
+  // only if a CHANGED row keeps both length and FNV-1a32 (~2^-32 per changed
+  // row); such a stale row self-heals the next time it changes.
+  void beginHashed(uint32_t *glassHash, uint16_t *glassLen, int height) {
+    gh = glassHash; gl = glassLen; h = height; g = nullptr; sl = 0; valid = false;
+  }
 
   // Next flush() pushes everything (boot, decode-palette change, panel reset).
   void invalidate() { valid = false; }
@@ -74,8 +83,40 @@ public:
     return pushed;
   }
 
+  // Hashed-mode flush: compare (len, hash) per row; coalesce and push like flush().
+  // Pair with beginHashed(). Returns rows pushed.
+  template <typename PushBand>
+  int flushHashed(const uint16_t *lineLen, const uint32_t *lineHash, int gap, PushBand pushBand) {
+    if (!gh || !gl) { pushBand(0, h - 1); return h; }
+    if (!valid) {
+      pushBand(0, h - 1);
+      memcpy(gl, lineLen, (size_t)h * sizeof(uint16_t));
+      memcpy(gh, lineHash, (size_t)h * sizeof(uint32_t));
+      valid = true;
+      return h;
+    }
+    int pushed = 0, bandStart = -1, lastDirty = -1;
+    for (int y = 0; y < h; y++) {
+      if (lineLen[y] != gl[y] || lineHash[y] != gh[y]) {
+        gl[y] = lineLen[y]; gh[y] = lineHash[y];
+        if (bandStart < 0) bandStart = y;
+        lastDirty = y;
+      } else if (bandStart >= 0 && y - lastDirty > gap) {
+        pushBand(bandStart, lastDirty);
+        pushed += lastDirty + 1 - bandStart;
+        bandStart = -1;
+      }
+    }
+    if (bandStart >= 0) {
+      pushBand(bandStart, lastDirty);
+      pushed += lastDirty + 1 - bandStart;
+    }
+    return pushed;
+  }
+
 private:
   uint8_t  *g = nullptr;
+  uint32_t *gh = nullptr;
   uint16_t *gl = nullptr;
   int       h = 0;
   size_t    sl = 0;
