@@ -28,8 +28,10 @@ class ST7789 {
 public:
   struct Pins { int8_t dc, cs, sck, mosi, rst, bl; };   // rst/bl < 0 = none
 
+  // colmod: 0x55 = RGB565 (2 B/px, default), 0x53 = RGB444 (3 B per 2 px — 25%
+  // less wire time; ideal for palette content, pair with prle_decode_p3).
   bool begin(spi_host_device_t host, const Pins &p, uint32_t clockHz,
-             uint32_t maxTransferBytes, bool ips = true) {
+             uint32_t maxTransferBytes, bool ips = true, uint8_t colmod = 0x55) {
     pins = p;
     pinMode(p.dc, OUTPUT); digitalWrite(p.dc, HIGH);
     pinMode(p.cs, OUTPUT); digitalWrite(p.cs, HIGH);
@@ -54,7 +56,7 @@ public:
 
     writeCmd(0x01); delay(150);                           // SWRESET
     writeCmd(0x11); delay(120);                           // SLPOUT
-    uint8_t colmod = 0x55; writeCmd(0x3A, &colmod, 1);    // 16 bpp
+    writeCmd(0x3A, &colmod, 1);                           // pixel format (see above)
     writeCmd(ips ? 0x21 : 0x20);                          // IPS modules: inversion ON
     writeCmd(0x13);                                       // NORON
     writeCmd(0x29); delay(10);                            // DISPON
