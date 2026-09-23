@@ -169,7 +169,7 @@ static void test_uc8179() {
 }
 
 static void test_ghost() {
-  const int W = 100, H = 20;                     // row bytes, rows
+  const int W = 100, H = 24;                     // row bytes, rows (3 cell rows of 8)
   std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
   EInkGhost g(H, W, 32);
   // one tick in a small box: a PARTIAL window around exactly the change
@@ -177,35 +177,52 @@ static void test_ghost() {
   EInkGhost::Plan p = g.plan(glass.data(), frame.data(), false, true);
   CHECK(p.kind == EInkGhost::PARTIAL && p.y0 == 5 && p.y1 == 7 && p.xb0 == 40 && p.xb1 == 43);
   g.done(p); glass = frame;
-  CHECK(g.wear(5) == 1 && g.wear(4) == 0);
-  // ambient ticks wear by 1; past the budget the same change is a CLEAN of that box
+  CHECK(g.wear(5) == 1 && g.wear(12) == 0);
+  CHECK(g.headroom(0, 8, 40, 41) == 31 && g.headroom(0, 8, 41, 42) == 32);   // per cell, not per row
+  // each change wears its cells by 1; past the budget the same change is a CLEAN of whole cells
   int cleans = 0, partials = 0;
   for (int i = 0; i < 40; i++) {
     frame[5 * W + 40] ^= 0xFF;
     p = g.plan(glass.data(), frame.data(), false, true);
-    if (p.kind == EInkGhost::CLEAN) { cleans++; CHECK(p.y0 == 5 && p.xb0 <= 40 && p.xb1 >= 41); }
+    if (p.kind == EInkGhost::CLEAN) { cleans++; CHECK(p.y0 == 0 && p.y1 == 8 && p.xb0 <= 40 && p.xb1 >= 41); }
     else partials++;
     g.done(p); glass = frame;
   }
   CHECK(cleans == 1 && partials == 39);
-  // an event on a third-worn row cleans while it redraws anyway
+  // early clean is off by default: an event on a worn cell is a partial ...
   for (int i = 0; i < 12; i++) { frame[5 * W + 40] ^= 0xFF; p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
-  frame[5 * W + 41] = 0xAA;
+  frame[5 * W + 40] ^= 0x0F;                     // an event on the worn cell
+  CHECK(g.plan(glass.data(), frame.data(), false, false).kind == EInkGhost::PARTIAL);
+  // ... and with it on, a third-worn cell is cleaned while it is redrawn anyway
+  g.setEarlyClean(true);
   p = g.plan(glass.data(), frame.data(), false, false);
-  CHECK(p.kind == EInkGhost::CLEAN);
+  CHECK(p.kind == EInkGhost::CLEAN && p.y0 == 0 && p.y1 == 8);
   g.done(p); glass = frame;
-  CHECK(g.wear(5) == 0);
+  CHECK(g.headroom(0, 8, 40, 41) == 32 && g.wear(5) == 1);   // cleaned cell; its neighbour keeps its 1
+  g.setEarlyClean(false);
+  // a progress bar: one pixel further each tick along a row wears each cell it crosses 8 times,
+  // however long the bar runs (v1 charged the whole row every tick)
+  for (int x = 0; x < 160; x++) {
+    frame[18 * W + 10 + x / 8] |= (uint8_t) (0x80 >> (x % 8));
+    p = g.plan(glass.data(), frame.data(), false, true);
+    CHECK(p.kind == EInkGhost::PARTIAL);
+    g.done(p); glass = frame;
+  }
+  CHECK(g.wear(18) == 8 && g.headroom(16, 24, 10, 30) == 24);
   // nothing changed: nothing to do; forced: full
   CHECK(g.plan(glass.data(), frame.data()).kind == EInkGhost::NONE);
   CHECK(g.plan(glass.data(), frame.data(), true).kind == EInkGhost::FULL);
-  // a quiet screen finds its worn region
-  for (int i = 0; i < 10; i++) { frame[15 * W + 7] ^= 0xFF; p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
+  // a quiet screen finds its worn region (cells >= a quarter of the budget)
   EInkGhost::Plan q;
-  CHECK(g.idleClean(&q) && q.y0 == 15 && q.y1 == 16 && q.xb0 == 7 && q.xb1 == 8);
+  CHECK(g.idleClean(&q) && q.y0 == 16 && q.y1 == 24 && q.xb0 == 10 && q.xb1 == 30);
   g.done(q);
-  CHECK(!g.idleClean(&q));
+  CHECK(!g.idleClean(&q) && g.maxWear() == 1);
   g.setTemperature(5.0f);
   CHECK(g.budget() == 16);
+  g.setBudget(360);
+  CHECK(g.budget() == 180);                      // still cold: half
+  g.setTemperature(22.0f);
+  CHECK(g.budget() == 360);
 }
 
 int main(int argc, char **argv) {
