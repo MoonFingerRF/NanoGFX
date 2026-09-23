@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""ttf2gfxfont.py -- a TrueType/OpenType font as a GFXfont header, with PIL instead of FreeType.
+
+GFXfont is Adafruit's proportional-font format (gfxfont.h, fontconvert). NanoGFX draws it in
+both builds -- over Adafruit_GFX on Arduino and over NanoGFXBase.h everywhere else -- so a header
+from this tool works on either. It exists because fontconvert needs a FreeType build and a C
+compiler, and this needs only `pip install pillow`.
+
+    python3 tools/ttf2gfxfont.py Font.ttf 24 > Font24.h                 # printable ASCII
+    python3 tools/ttf2gfxfont.py Font.ttf 24 --last 0xFF --name Serif24  # + Latin-1 (° · é ...)
+    python3 tools/ttf2gfxfont.py Font.ttf 24 --preview out.png           # eyeball it first
+
+Glyphs are rendered WITHOUT anti-aliasing (a 1-bit panel has no grey to give an edge), at the
+pixel size asked for: `size` is PIL's em size in pixels, and yAdvance is the font's own line
+height at that size. Offsets follow fontconvert exactly: xOffset/yOffset are from the cursor
+(on the baseline) to the glyph bitmap's top-left, so text drawn with setFont() lands on the same
+baseline an Adafruit font would.
+
+`--threshold` (0..255, default 128) is where a partly covered pixel becomes ink when rendering
+through the anti-aliased path; `--mono` (default) asks PIL for its own 1-bit rasteriser instead,
+which is usually crisper for small serif text.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+def render(font: ImageFont.FreeTypeFont, ch: str, mono: bool, threshold: int):
+    """(bitmap rows as lists of 0/1, x0, y0, advance) for one character, relative to the baseline."""
+    advance = int(round(font.getlength(ch)))
+    box = font.getbbox(ch, anchor="ls")
+    x0, y0, x1, y1 = box
+    w, h = max(0, x1 - x0), max(0, y1 - y0)
+    if w == 0 or h == 0:
+        return [], 0, 0, advance
+    img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(img)
+    if mono:
+        draw.fontmode = "1"
+    draw.text((-x0, -y0), ch, font=font, fill=255, anchor="ls")
+    px = img.load()
+    rows = [[1 if px[x, y] >= threshold else 0 for x in range(w)] for y in range(h)]
+    # Trim empty rows/columns the bbox left (the 1-bit rasteriser can be thinner than the box).
+    while rows and not any(rows[0]):
+        rows.pop(0); y0 += 1
+    while rows and not any(rows[-1]):
+        rows.pop()
+    if not rows:
+        return [], 0, 0, advance
+    while not any(r[0] for r in rows):
+        rows = [r[1:] for r in rows]; x0 += 1
+    while not any(r[-1] for r in rows):
+        rows = [r[:-1] for r in rows]
+    return rows, x0, y0, advance
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("font")
+    ap.add_argument("size", type=int, help="em size in pixels")
+    ap.add_argument("--first", type=lambda s: int(s, 0), default=0x20)
+    ap.add_argument("--last", type=lambda s: int(s, 0), default=0x7E)
+    ap.add_argument("--name", default="", help="C identifier (default: from the file name + size)")
+    ap.add_argument("--aa", action="store_true", help="threshold the anti-aliased raster instead of --mono")
+    ap.add_argument("--threshold", type=int, default=128)
+    ap.add_argument("--preview", default="", help="also write a PNG sheet of every glyph")
+    args = ap.parse_args()
+
+    font = ImageFont.truetype(args.font, args.size)
+    name = args.name or re.sub(r"\W", "", args.font.rsplit("/", 1)[-1].rsplit(".", 1)[0]) + str(args.size)
+    ascent, descent = font.getmetrics()
+    bits: list[int] = []
+    glyphs = []
+    for code in range(args.first, args.last + 1):
+        ch = chr(code)
+        if 0x7F <= code <= 0x9F:          # C1 controls: an empty glyph, not a box
+            rows, x0, y0, adv = [], 0, 0, 0
+        else:
+            rows, x0, y0, adv = render(font, ch, not args.aa, args.threshold)
+        h = len(rows)
+        w = len(rows[0]) if rows else 0
+        if w > 255 or h > 255 or adv > 255 or not (-128 <= x0 <= 127) or not (-128 <= y0 <= 127):
+            raise SystemExit(f"glyph U+{code:04X} does not fit a GFXglyph at size {args.size}")
+        offset = len(bits) // 8
+        for r in rows:
+            bits.extend(r)
+        while len(bits) % 8:           # each glyph starts on a byte, as fontconvert does
+            bits.append(0)
+        glyphs.append((offset, w, h, adv, x0, y0, code))
+    data = bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+    if len(data) > 0xFFFF:
+        raise SystemExit("bitmap is over 64 KiB; GFXglyph.bitmapOffset is 16 bits -- use a smaller size or range")
+
+    out = sys.stdout
+    out.write(f"// {name}: {args.font.rsplit('/', 1)[-1]} at {args.size} px, "
+              f"U+{args.first:04X}..U+{args.last:04X}, {'mono' if not args.aa else 'thresholded'} raster.\n")
+    out.write("// Generated by NanoGFX tools/ttf2gfxfont.py -- do not edit; regenerate instead.\n")
+    out.write("#pragma once\n\n")
+    out.write(f"static const uint8_t {name}Bitmaps[] PROGMEM = {{\n")
+    for i in range(0, len(data), 16):
+        out.write("  " + ", ".join(f"0x{b:02X}" for b in data[i:i + 16]) + ",\n")
+    out.write("};\n\n")
+    out.write(f"static const GFXglyph {name}Glyphs[] PROGMEM = {{\n")
+    for off, w, h, adv, x0, y0, code in glyphs:
+        shown = chr(code) if 0x20 < code < 0x7F and chr(code) not in "\\'" else ""
+        out.write(f"  {{{off:5d}, {w:3d}, {h:3d}, {adv:3d}, {x0:4d}, {y0:4d}}},  // 0x{code:02X} {shown}\n")
+    out.write("};\n\n")
+    out.write(f"static const GFXfont {name} PROGMEM = {{(uint8_t *){name}Bitmaps, (GFXglyph *){name}Glyphs, "
+              f"0x{args.first:02X}, 0x{args.last:02X}, {ascent + descent}}};\n")
+    out.write(f"// ascent {ascent}, descent {descent}, {len(data)} bitmap bytes\n")
+
+    if args.preview:
+        cols = 16
+        cell_w = max(g[3] for g in glyphs) + 4
+        cell_h = ascent + descent + 4
+        n = len(glyphs)
+        sheet = Image.new("1", (cols * cell_w, ((n + cols - 1) // cols) * cell_h), 1)
+        for i, (off, w, h, adv, x0, y0, code) in enumerate(glyphs):
+            ox, oy = (i % cols) * cell_w + 2, (i // cols) * cell_h + 2 + ascent
+            bitpos = off * 8
+            for yy in range(h):
+                for xx in range(w):
+                    if bits[bitpos + yy * w + xx]:
+                        sheet.putpixel((ox + x0 + xx, oy + y0 + yy), 0)
+        sheet.save(args.preview)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

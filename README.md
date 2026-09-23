@@ -5,6 +5,13 @@ canvas that stores **2 pixels per byte**, fuses most of an RLE encode into the d
 itself, renders text with a dual-parity blitter, and pushes frames with **split-polling
 QSPI writes** that send **only the rows that changed**.
 
+It also drives **1-bit e-paper**: the same canvas exports to an 800×480 UC8179 panel
+through an ordered dither, a per-region ghosting policy picks partial / clean-window / full
+refreshes, and the driver never blocks your loop while the glass updates.
+
+Builds **with or without Arduino**: on Arduino it sits on Adafruit_GFX; on ESP-IDF, ESPHome
+or a desktop compiler it uses its own Adafruit-compatible base (`NanoGFXBase.h`).
+
 Battle-tested in [NanoPFD](https://github.com/MoonFingerRF/NanoPFD), an ESP32-S3 glass
 cockpit: a 450×600 AMOLED runs **46–48 fps** with a WiFi access point and two Remote ID
 receivers (BLE + WiFi) live on the same chip.
@@ -23,6 +30,16 @@ what a small MCU can drive:
 | draw a 100 px H-line | 100 byte writes | **50 byte writes** | **1 run-list entry** |
 | RLE-encode a drawn line | full pixel scan | word-batched scan | **near-free** (already runs) |
 | fill / clear | memset W×H | memset W×H/2 | **one run per line** |
+
+## Supported displays
+
+| Display | Driver | Notes |
+|---|---|---|
+| RM690B0 QSPI AMOLED (LilyGO T4-S3, 450×600) | `RM690B0.h` (ESP32) | split-polling QSPI, dirty rows only |
+| ST7789 SPI TFTs (240×240/280/320) | `ST7789.h` (ESP32) | same pipeline, RGB444 wire option |
+| RGB parallel panels (ST7701S etc., LCD_CAM) | none needed | decode dirty rows into the scanned framebuffer |
+| **UC8179 7.5" e-paper, 800×480** (Seeed reTerminal E1001, Waveshare 7.5" V2, GoodDisplay GDEY075T7) | `UC8179.h` (any MCU, your bus) | non-blocking full / partial / clean-window refresh |
+| Any other 1-bit panel (SSD16xx e-paper, mono OLED/LCD) | your driver | `PackMono` exports MSB-first 1-bit rows |
 
 ## The pieces
 
@@ -54,6 +71,21 @@ what a small MCU can drive:
   polling transfer**: the SPI DMA shifts chunk *n* out while your CPU decodes chunk
   *n+1* — the transfer time hides under compute without the interrupt-driven queued
   path (which some panels, including this one, cannot sustain).
+- **`PackMono`** — a packed canvas out to a **1-bit panel**. Each palette index gets an ink
+  level 0–16; greys become a 4×4 ordered dither on export, so a grey fill stays one flat,
+  compressible colour on the canvas. `diffRows()` finds the rows two exported frames differ in.
+- **`UC8179`** — **non-blocking e-paper driver** for 800×480 UC8179 panels. `startFull()` /
+  `startPartial()` queue a refresh and `poll()` advances it one step at a time, so a 4 s
+  refresh never stalls buttons or networking. Partial windows are narrowed to the changed
+  byte columns; a *clean* window runs the full waveform inside the window only; the rails can
+  stay up for a run of 1 Hz updates. Bring your own bus (Arduino SPI, ESP-IDF, ESPHome, a
+  simulator).
+- **`EInkGhost`** — **e-paper ghosting policy, per region.** Tracks wear per row (a ticking
+  clock adds a little, a real change adds more) and answers PARTIAL, CLEAN window, or FULL, so
+  a busy corner gets cleaned on its own instead of flashing the whole screen.
+- **PackRLE images + `tools/packrle.py`** — a whole picture as one blob (rows with length
+  prefixes), encoded on a host in pure Python and decoded on the device.
+- **`tools/ttf2gfxfont.py`** — any TrueType font as a GFXfont header, no FreeType build needed.
 - **`ST7789`** (ESP32) — the same driver shape for classic 4-wire-SPI TFTs
   (240×240/280/320 modules), with the same split-polling overlap and explicit
   per-rotation window origins. RGB *parallel* panels (LCD_CAM framebuffers) need no
@@ -112,9 +144,37 @@ void frame() {
 }
 ```
 
+E-paper (800×480 UC8179), without blocking the loop:
+
+```cpp
+#include <NanoGFX.h>
+#include <UC8179.h>
+
+struct Bus { /* command(), data(), busy(), reset(), delayMs(), millis() over your SPI */ };
+Bus bus;
+UC8179<Bus> epd(bus);
+PackCanvas canvas(800, 480, false);   // 192 KB packed: put it in PSRAM
+PackMono mono;                        // palette index -> ink level -> dither
+EInkGhost ghost(480, 100);            // per-row wear -> PARTIAL / CLEAN / FULL
+uint8_t *frame, *glass;               // 48 KB each: next frame, what the glass shows
+
+void loop() {
+  epd.poll();                                       // returns at once
+  if (!epd.isIdle() || !somethingChanged()) return;
+  draw(canvas);
+  mono.exportRows(canvas, frame, 0, 480);
+  EInkGhost::Plan p = ghost.plan(glass, frame);
+  // start p with epd.startFull / epd.startPartial(frame, glass, p.y0, p.y1, clean, p.xb0, p.xb1);
+  // when isIdle() again: ghost.done(p) and copy frame -> glass
+}
+```
+
+`examples/UC8179_EInk` is the complete version.
+
 See `examples/` for complete sketches, including the full ESP32-S3 AMOLED pipeline —
 and **[docs/API.md](docs/API.md) for the complete function reference** (every PackCanvas /
-PackRLE / PackFlush / RM690B0 call, plus the format contracts).
+PackRLE / PackFlush / RM690B0 / ST7789 / PackMono / UC8179 / EInkGhost call, the standalone
+and ESP-IDF builds, plus the format contracts).
 
 ## Examples
 
@@ -131,6 +191,17 @@ PackRLE / PackFlush / RM690B0 call, plus the format contracts).
 - **`RM690B0_DirtyPush`** (ESP32-S3) — the complete NanoPFD pipeline on a LilyGO T4-S3:
   dual-mode canvas → `encodeFrame` → `PackFlush` dirty bands → split-polling QSPI push,
   with per-frame stats printed (rows pushed, decode µs, wire µs).
+- **`UC8179_EInk`** (ESP32-S3 + PSRAM) — a 7.5" e-paper panel (pins for the Seeed reTerminal
+  E1001): a grey panel dithered by `PackMono`, a 1 Hz progress bar as a tiny partial window,
+  `EInkGhost` choosing clean windows as rows wear, refresh timings on the serial log.
+
+## Building
+
+- **Arduino:** install Adafruit GFX Library, then this library; open an example.
+- **ESP-IDF / ESPHome:** the repo is an ESP-IDF component (`nanogfx: { path: ../NanoGFX }`).
+  Adafruit_GFX is not needed; `NanoGFXBase.h` is used automatically.
+- **Host:** `c++ -std=c++17 -I src tests/host_standalone.cpp -o ngfx_host && ./ngfx_host`
+  (canvas, text, PackMono, PackRLE images, the UC8179 state machine on a simulated bus).
 
 ## Rules of the road
 
@@ -140,6 +211,9 @@ PackRLE / PackFlush / RM690B0 call, plus the format contracts).
   `rawBuffer()` — see the "raw-access contract" in `PackCanvas.h`.
 - `PackFlush::invalidate()` whenever identical encoded bytes would stop meaning identical
   pixels: decode-palette edits, panel re-init, brightness-independent GRAM loss.
+- E-paper: call `EInkGhost::done()` once per completed refresh and copy the frame to your
+  on-glass buffer then; the next partial needs the true on-glass image. On ESP32 keep the
+  `UC8179` object in internal RAM (its line buffer is what SPI DMA reads).
 - The RM690B0 driver is polling by design; the split calls are the overlap mechanism.
   One transfer in flight at a time; don't touch the buffer until `ramWriteEnd()`.
 
@@ -151,4 +225,4 @@ ST7701S, and the QSPI RM690B0 AMOLED). The canvas ships with a fuzz oracle in th
 project (`tools/gfxbench`) proving byte-identical behavior against stock Adafruit_GFX
 across formats, rotations, and the text blitter — 2.2M checks per run.
 
-MIT license.
+MIT license. `NanoGFXBase.h` carries Adafruit_GFX code under its BSD license (`LICENSE-Adafruit-GFX`).

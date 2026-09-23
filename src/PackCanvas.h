@@ -19,7 +19,24 @@
 //  reusable in any Adafruit_GFX project. See PackRLE.h for the stream format.
 // ============================================================================
 #pragma once
+// Two builds, one class. With Adafruit_GFX installed (Arduino) PackCanvas derives from it
+// exactly as before; without it (ESP-IDF, ESPHome, a host compiler), or when
+// NANOGFX_STANDALONE is defined, it derives from NanoGFXBase.h, the same drawing and text
+// code with no Arduino underneath. NGFX_GFX / NGFX_CANVAS8 name whichever base is in use.
+#if !defined(NANOGFX_STANDALONE) && defined(__has_include)
+#if !__has_include(<Adafruit_GFX.h>)
+#define NANOGFX_STANDALONE 1
+#endif
+#endif
+#ifdef NANOGFX_STANDALONE
+#include "NanoGFXBase.h"
+typedef NanoGFX_Base NGFX_GFX;
+typedef NanoGFX_Canvas8 NGFX_CANVAS8;
+#else
 #include <Adafruit_GFX.h>
+typedef Adafruit_GFX NGFX_GFX;
+typedef GFXcanvas8 NGFX_CANVAS8;
+#endif
 #include "PackRLE.h"
 #include "PackFont5x7.h"
 
@@ -55,7 +72,7 @@
 //  Fuzz coverage: tools/gfxbench/run_tests.sh (codec roundtrips + 10k-frame canvas
 //  equivalence incl. splice/merge/explode paths, byte-identical vs flat).
 // ============================================================================
-class PackCanvas : public GFXcanvas8 {
+class PackCanvas : public NGFX_CANVAS8 {
 public:
   bool packed4  = false;       // false = 8-bit (default), true = 4-bit packed
   bool dualMode = false;       // packed4 only: enable per-line RUNS/FLAT (see above)
@@ -69,7 +86,7 @@ public:
                                            // busy rows demote on their first pixel anyway
   static constexpr int NANO_MAX_W = 1024;  // stack render temp = PRLE_STRIDE(1024) = 512 B
 
-  PackCanvas(uint16_t w, uint16_t h, bool allocate_buffer = true) : GFXcanvas8(w, h, allocate_buffer) {
+  PackCanvas(uint16_t w, uint16_t h, bool allocate_buffer = true) : NGFX_CANVAS8(w, h, allocate_buffer) {
     setRotationMatrix();
     // Slot bytes per line, rounded EVEN: run-lists overlay the slot as uint16_t
     // entries, so an odd PRLE_STRIDE (any w with w/2 odd, e.g. 450 -> 225) would
@@ -135,7 +152,7 @@ public:
         if ((uint16_t)tx >= (uint16_t)WIDTH || (uint16_t)ty >= (uint16_t)HEIGHT) return;
         pix4(tx, ty, (uint8_t)color);
       } else {
-        GFXcanvas8::drawPixel(tx, ty, color);                 // rotation-aware base
+        NGFX_CANVAS8::drawPixel(tx, ty, color);                 // rotation-aware base
       }
       return;
     }
@@ -150,7 +167,7 @@ public:
   }
   void fastDrawPixel(int16_t x, int16_t y, uint16_t color) {
     if (packed4) putNib(x, y, (uint8_t)color);
-    else GFXcanvas8::drawPixel(x, y, color);
+    else NGFX_CANVAS8::drawPixel(x, y, color);
   }
   // Text/glyphs are drawn a pixel at a time via writePixel(). Override it so the common
   // identity case skips the virtual drawPixel() dispatch and the rotation re-check on
@@ -172,7 +189,7 @@ public:
 
   void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t color) {
     if (!identity) { for (int16_t i = 0; i < w; i++) drawPixel(x + i, y, color); return; }
-    if (!packed4 && rotation != 0) { GFXcanvas8::drawFastHLine(x, y, w, color); return; }
+    if (!packed4 && rotation != 0) { NGFX_CANVAS8::drawFastHLine(x, y, w, color); return; }
     if (w <= 0 || y < 0 || y >= HEIGHT) return;
     if (x < 0) { w += x; x = 0; }
     if (x + w > WIDTH) w = WIDTH - x;
@@ -189,7 +206,7 @@ public:
 
   void drawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t color) {
     if (!identity) { for (int16_t i = 0; i < h; i++) drawPixel(x, y + i, color); return; }
-    if (!packed4 && rotation != 0) { GFXcanvas8::drawFastVLine(x, y, h, color); return; }
+    if (!packed4 && rotation != 0) { NGFX_CANVAS8::drawFastVLine(x, y, h, color); return; }
     if (h <= 0 || x < 0 || x >= WIDTH) return;
     if (y < 0) { h += y; y = 0; }
     if (y + h > HEIGHT) h = HEIGHT - y;
@@ -220,7 +237,7 @@ public:
     // Fast path only for the clean case; every quirk case (negative spans, active
     // matrix) delegates to the base column-major chain so legacy sign-normalization
     // semantics stay bit-exact with the historical canvases.
-    if (!identity || w <= 0 || h <= 0) { Adafruit_GFX::fillRect(x, y, w, h, color); return; }
+    if (!identity || w <= 0 || h <= 0) { NGFX_GFX::fillRect(x, y, w, h, color); return; }
     for (int16_t j = 0; j < h; j++) drawFastHLine(x, y + j, w, color);
   }
 
@@ -268,7 +285,7 @@ public:
     if (!fastText || gfxFont || !packed4 || !identity ||
         textcolor != textbgcolor || textsize_x != textsize_y ||
         textsize_x < 1 || textsize_x > 4)
-      return Adafruit_GFX::write(ch);
+      return NGFX_GFX::write(ch);
     if (ch == '\n') { cursor_x = 0; cursor_y += textsize_y * 8; return 1; }
     if (ch == '\r') return 1;
     uint8_t s = textsize_x;
@@ -280,7 +297,7 @@ public:
     return 1;
   }
   uint8_t textScale = 1;
-  void setTextSize(uint8_t s) { GFXcanvas8::setTextSize((uint8_t)(s * textScale)); }
+  void setTextSize(uint8_t s) { NGFX_CANVAS8::setTextSize((uint8_t)(s * textScale)); }
 
   // Buffer bytes for a w*h canvas in the given format. Packed canvases are laid
   // out as per-line slots of lineSlotBytes() (PRLE_STRIDE rounded even), NOT as
@@ -377,7 +394,7 @@ public:
   bool fastLine = true;
   void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color) {
     if (!fastLine || !identity || (!packed4 && rotation != 0)) {
-      Adafruit_GFX::drawLine(x0, y0, x1, y1, color);
+      NGFX_GFX::drawLine(x0, y0, x1, y1, color);
       return;
     }
     if (x0 == x1) {                                  // vertical (base-class semantics)
@@ -414,7 +431,7 @@ public:
   // ---- pixel read (format-aware, non-mutating) -------------------------------
   // Palette index at (x, y). Packed RUNS lines are read by walking the run list —
   // reading never explodes a line. The 8-bit path honours setRotation() exactly
-  // like GFXcanvas8::getPixel. Out of bounds -> 0.
+  // like NGFX_CANVAS8::getPixel. Out of bounds -> 0.
   uint8_t getPixel(int16_t x, int16_t y) const {
     if (!packed4) {
       if ((uint16_t)x >= (uint16_t)_width || (uint16_t)y >= (uint16_t)_height) return 0;
