@@ -344,6 +344,31 @@ exports by default). The driver keeps pointers to your frames; it does not copy 
 **Measured** on a reTerminal E1001 (ESP32-S3, SPI 10 MHz): full refresh 4.05 s; full-width
 partial with rails up 1.1–1.2 s; a 104×17 px partial window 0.88 s (SPI 1 ms, waveform 865 ms).
 
+**Fast register-LUT waveform** (`startFast`, `fastVcom`, `partialTemperature`). Verified against
+the UC8179c datasheet (rev C0.6) before use: PSR bit 5 = REG, bit 4 = KW; LUTC/KW/WK/KK 60 bytes,
+LUTWW/LUTBD 42 (7 groups used in KW mode); levels 00 GND, 01 VDH, 10 VDL, 11 VDHR; VDCS `0x82`
+V = −0.10 − 0.05 × code; PLL `0x30` default 50 Hz (untouched). With DDX = 01 the tables are
+{NEW,OLD} 01 → WK, 10 → KW, 00 → KK, 11 → WW, and CDI BDV = 11 routes the border to LUTBD.
+
+| Function | Description |
+|---|---|
+| `bool startFast(frame, prev, y0, y1, xb0, xb1, uint8_t frames)` | A window refreshed with one phase of `frames` at VDL (K→W) / VDH (W→K); WW, KK and the border are all-zero tables (unchanged pixels never driven). `frames` 1–60. |
+| `void fastVcom(uint8_t code, uint8_t table = 0)` | The fast path's VCOM_DC (clamped 0x12–0x40) and VCOM table (0: VCOM_DC for the phase; 1: all-zero). |
+| `bool fastActive()` | Register LUTs are loaded: the next factory refresh of any kind starts with a hardware reset + `begin()` (vendor registers). |
+| `void partialTemperature(uint8_t t)` | The forced temperature (`0xE5`) that picks which factory OTP waveform a partial uses (default 0x6E). |
+
+**Measured** on a reTerminal E1001 (2026-09-23, 23.5 °C, camera vs untouched glass):
+- *VCOM matters.* At −2.00 V every fast refresh greyed all glass **outside** the window (−30 levels
+  over 20 refreshes; VCOM is one electrode for the whole panel). A sweep found −1.00 V (code 0x12,
+  table 0) drifts ≈ 0 over 20 refreshes; that is the default.
+- *Frame count* (10 frames = N_min at ≥ 90 % of factory contrast): 16 fr 0.62 s/transition (100 %),
+  13 fr 0.58 s (96 %), **10 fr 0.51 s (93 %)**, 8 fr 0.46 s (88 %). Factory partials: 0.89 s.
+- *On a 240×128 art window:* 344 ms a frame (waveform 320 ms), 1 frame/s for 5 minutes, untouched
+  glass +1.5.
+- *Haze in the window* after 20 / 40 / 80 / 160 full toggles: +3.1 / +2.8 / +3.3 / +4.0 (factory
+  partial: ≈0 / +3 / +6.5 / +10). A full refresh restores it.
+- The factory OTP bins (forcing `0xE5`): none faster than 0x6E's 864 ms waveform.
+
 **Border.** Both refresh kinds drive the border (CDI `0x11` full / `0x19` partial). Waveshare's
 partial sequence floats it (`0xA9`); with the rails kept up between updates a floating border
 drifts into a grey outline round the picture.
