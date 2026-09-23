@@ -69,6 +69,12 @@ public:
   // white-on-black, so that board sets invert(true). Applies to full and partial alike.
   void invert(bool on) { invert_ = on; }
 
+  // The forced temperature for partial refreshes (0xE5 with cascade 0xE0 = 02). It selects which of
+  // the panel's OWN factory (OTP) waveforms a partial uses: 0x6E is the vendor's fast partial (the
+  // default); 0x5A its fast full; others are undocumented bins. No custom LUT is ever loaded here.
+  void partialTemperature(uint8_t t) { partialTemp_ = t; }
+  uint8_t partialTemperature() const { return partialTemp_; }
+
   // Hard reset + register setup. Blocking (~300 ms). Call once, and again after a timeout.
   // The controller is BUSY for a while after RST rises and ignores commands until it lets go,
   // so the reset is long (the Waveshare/ESPHome 200 ms) and every step waits for BUSY: a panel
@@ -148,8 +154,8 @@ public:
     if (clean) {
       cmd(0xE0, {0x00});                   // cascade off: the temperature-selected full LUT
     } else {
-      cmd(0xE0, {0x02});                   // cascade on:
-      cmd(0xE5, {0x6E});                   //   the fast partial waveform
+      cmd(0xE0, {0x02});                   // cascade on: a forced temperature selects one of the
+      cmd(0xE5, {partialTemp_});           //   panel's own OTP waveforms (0x6E: the fast partial)
     }
     powerOn();
     return true;
@@ -218,6 +224,7 @@ private:
   bool stay_ = false, powered_ = false;
   int xb0_ = 0, xb1_ = ROW;
   Timing timing_{0, 0, 0, 0};
+  uint8_t partialTemp_ = 0x6E;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
