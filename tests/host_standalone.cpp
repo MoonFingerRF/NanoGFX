@@ -171,18 +171,18 @@ static void test_uc8179() {
 static void test_ghost() {
   const int W = 100, H = 24;                     // row bytes, rows (3 cell rows of 8)
   std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
-  EInkGhost g(H, W, 32);
-  // one tick in a small box: a PARTIAL window around exactly the change
+  EInkGhost g(H, W, 32);                         // 32 full toggles a cell
+  auto toggleCell = [&](int cy, int b) { for (int r = 0; r < 8; r++) frame[(cy * 8 + r) * W + b] ^= 0xFF; };
+  // one small change: a PARTIAL window around exactly the change
   frame[5 * W + 40] = 0xF0; frame[6 * W + 42] = 0x01;
   EInkGhost::Plan p = g.plan(glass.data(), frame.data(), false, true);
   CHECK(p.kind == EInkGhost::PARTIAL && p.y0 == 5 && p.y1 == 7 && p.xb0 == 40 && p.xb1 == 43);
   g.done(p); glass = frame;
-  CHECK(g.wear(5) == 1 && g.wear(12) == 0);
-  CHECK(g.headroom(0, 8, 40, 41) == 31 && g.headroom(0, 8, 41, 42) == 32);   // per cell, not per row
-  // each change wears its cells by 1; past the budget the same change is a CLEAN of whole cells
+  CHECK(g.wear(5) == 0 && g.headroom(0, 8, 40, 41) == 31);   // 4 of 64 pixels: under 1 toggle
+  // a whole cell flipped each time wears it by 1; past the budget it is a CLEAN of whole cells
   int cleans = 0, partials = 0;
   for (int i = 0; i < 40; i++) {
-    frame[5 * W + 40] ^= 0xFF;
+    toggleCell(0, 40);
     p = g.plan(glass.data(), frame.data(), false, true);
     if (p.kind == EInkGhost::CLEAN) { cleans++; CHECK(p.y0 == 0 && p.y1 == 8 && p.xb0 <= 40 && p.xb1 >= 41); }
     else partials++;
@@ -190,7 +190,7 @@ static void test_ghost() {
   }
   CHECK(cleans == 1 && partials == 39);
   // early clean is off by default: an event on a worn cell is a partial ...
-  for (int i = 0; i < 12; i++) { frame[5 * W + 40] ^= 0xFF; p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
+  for (int i = 0; i < 12; i++) { toggleCell(0, 40); p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
   frame[5 * W + 40] ^= 0x0F;                     // an event on the worn cell
   CHECK(g.plan(glass.data(), frame.data(), false, false).kind == EInkGhost::PARTIAL);
   // ... and with it on, a third-worn cell is cleaned while it is redrawn anyway
@@ -198,25 +198,27 @@ static void test_ghost() {
   p = g.plan(glass.data(), frame.data(), false, false);
   CHECK(p.kind == EInkGhost::CLEAN && p.y0 == 0 && p.y1 == 8);
   g.done(p); glass = frame;
-  CHECK(g.headroom(0, 8, 40, 41) == 32 && g.wear(5) == 1);   // cleaned cell; its neighbour keeps its 1
+  CHECK(g.headroom(0, 8, 40, 41) == 32);
   g.setEarlyClean(false);
-  // a progress bar: one pixel further each tick along a row wears each cell it crosses 8 times,
-  // however long the bar runs (v1 charged the whole row every tick)
+  // a progress bar: one pixel further each tick flips each pixel once -- 1/8 of a toggle per cell
   for (int x = 0; x < 160; x++) {
     frame[18 * W + 10 + x / 8] |= (uint8_t) (0x80 >> (x % 8));
     p = g.plan(glass.data(), frame.data(), false, true);
     CHECK(p.kind == EInkGhost::PARTIAL);
     g.done(p); glass = frame;
   }
-  CHECK(g.wear(18) == 8 && g.headroom(16, 24, 10, 30) == 24 && g.lastHeadroom() == 24);
+  CHECK(g.wear(18) == 0 && g.headroom(16, 24, 10, 30) == 31 && g.lastHeadroom() >= 2000);
   // nothing changed: nothing to do; forced: full
   CHECK(g.plan(glass.data(), frame.data()).kind == EInkGhost::NONE);
   CHECK(g.plan(glass.data(), frame.data(), true).kind == EInkGhost::FULL);
   // a quiet screen finds its worn region (cells >= a quarter of the budget)
   EInkGhost::Plan q;
-  CHECK(g.idleClean(&q) && q.y0 == 16 && q.y1 == 24 && q.xb0 == 10 && q.xb1 == 30);
+  CHECK(!g.idleClean(&q));
+  for (int i = 0; i < 10; i++) { toggleCell(2, 7); p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
+  CHECK(g.idleClean(&q) && q.y0 == 16 && q.y1 == 24 && q.xb0 == 7 && q.xb1 == 8 && g.maxWear() == 10);
+  CHECK(g.lastHeadroom() == 22);                 // (32 - 10) more like the last one
   g.done(q);
-  CHECK(!g.idleClean(&q) && g.maxWear() == 1);
+  CHECK(!g.idleClean(&q));
   g.setTemperature(5.0f);
   CHECK(g.budget() == 16);
   g.setBudget(360);
