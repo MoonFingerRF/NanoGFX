@@ -7,6 +7,7 @@
 #include "NanoGFX.h"
 #include "PackMono.h"
 #include "UC8179.h"
+#include "EInkGhost.h"
 #include <stdio.h>
 #include <vector>
 
@@ -139,6 +140,24 @@ static void test_uc8179() {
   while (!epd.isIdle() && guard++ < 20000) { bus.t += 5; epd.poll(); }
   CHECK(bus.dataBytes >= 2u * 40 * 100 && bus.dataBytes < 2u * 41 * 100 + 64);  // only the window, twice
   CHECK(epd.partialsSinceFull() == 1);
+  CHECK(!epd.powered());
+  // A narrow window sends only its own bytes; staying powered skips the rails.
+  bus.dataBytes = 0;
+  epd.stayPowered(true);
+  CHECK(epd.startPartial(b, a, 10, 20, false, 4, 6));
+  while (!epd.isIdle() && guard++ < 30000) { bus.t += 5; epd.poll(); }
+  CHECK(bus.dataBytes >= 2u * 10 * 2 && bus.dataBytes < 2u * 10 * 2 + 64);
+  CHECK(epd.powered() && epd.lastTiming().off == 0);
+  size_t cmds = bus.cmds.size();
+  CHECK(epd.startPartial(b, a, 10, 20, false, 4, 6));
+  bool sawPowerOn = false;
+  while (!epd.isIdle() && guard++ < 40000) { bus.t += 5; epd.poll(); }
+  for (size_t i = cmds; i < bus.cmds.size(); i++) sawPowerOn |= bus.cmds[i] == 0x04;
+  CHECK(!sawPowerOn);
+  CHECK(epd.powerDown());
+  while (!epd.isIdle() && guard++ < 50000) { bus.t += 5; epd.poll(); }
+  CHECK(!epd.powered());
+  epd.stayPowered(false);
   bool sawWindow = false;
   for (uint8_t c : bus.cmds) sawWindow |= c == 0x90;
   CHECK(sawWindow);
@@ -149,11 +168,52 @@ static void test_uc8179() {
   CHECK(epd.faulted());
 }
 
+static void test_ghost() {
+  const int W = 100, H = 20;                     // row bytes, rows
+  std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
+  EInkGhost g(H, W, 32);
+  // one tick in a small box: a PARTIAL window around exactly the change
+  frame[5 * W + 40] = 0xF0; frame[6 * W + 42] = 0x01;
+  EInkGhost::Plan p = g.plan(glass.data(), frame.data(), false, true);
+  CHECK(p.kind == EInkGhost::PARTIAL && p.y0 == 5 && p.y1 == 7 && p.xb0 == 40 && p.xb1 == 43);
+  g.done(p); glass = frame;
+  CHECK(g.wear(5) == 1 && g.wear(4) == 0);
+  // ambient ticks wear by 1; past the budget the same change is a CLEAN of that box
+  int cleans = 0, partials = 0;
+  for (int i = 0; i < 40; i++) {
+    frame[5 * W + 40] ^= 0xFF;
+    p = g.plan(glass.data(), frame.data(), false, true);
+    if (p.kind == EInkGhost::CLEAN) { cleans++; CHECK(p.y0 == 5 && p.xb0 <= 40 && p.xb1 >= 41); }
+    else partials++;
+    g.done(p); glass = frame;
+  }
+  CHECK(cleans == 1 && partials == 39);
+  // an event on a third-worn row cleans while it redraws anyway
+  for (int i = 0; i < 12; i++) { frame[5 * W + 40] ^= 0xFF; p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
+  frame[5 * W + 41] = 0xAA;
+  p = g.plan(glass.data(), frame.data(), false, false);
+  CHECK(p.kind == EInkGhost::CLEAN);
+  g.done(p); glass = frame;
+  CHECK(g.wear(5) == 0);
+  // nothing changed: nothing to do; forced: full
+  CHECK(g.plan(glass.data(), frame.data()).kind == EInkGhost::NONE);
+  CHECK(g.plan(glass.data(), frame.data(), true).kind == EInkGhost::FULL);
+  // a quiet screen finds its worn region
+  for (int i = 0; i < 10; i++) { frame[15 * W + 7] ^= 0xFF; p = g.plan(glass.data(), frame.data(), false, true); g.done(p); glass = frame; }
+  EInkGhost::Plan q;
+  CHECK(g.idleClean(&q) && q.y0 == 15 && q.y1 == 16 && q.xb0 == 7 && q.xb1 == 8);
+  g.done(q);
+  CHECK(!g.idleClean(&q));
+  g.setTemperature(5.0f);
+  CHECK(g.budget() == 16);
+}
+
 int main(int argc, char **argv) {
   test_canvas_and_text();
   test_mono_export();
   test_prle_image(argc > 3 ? argv[1] : nullptr, argc > 3 ? atoi(argv[2]) : 37, argc > 3 ? atoi(argv[3]) : 11);
   test_uc8179();
+  test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;
 }

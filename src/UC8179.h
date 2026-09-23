@@ -51,6 +51,8 @@ public:
   static constexpr uint32_t BUSY_TIMEOUT_MS = 12000;   // a full refresh is ~4 s; this is a fault
 
   enum class Step : uint8_t { IDLE, POWER_WAIT, REFRESH_WAIT, OFF_WAIT };
+  // Where the last refresh spent its time, ms: rails up, SPI, waveform, rails down.
+  struct Timing { uint16_t power, send, refresh, off; };
 
   explicit UC8179(Bus &bus) : bus_(bus) {}
 
@@ -86,11 +88,28 @@ public:
   bool faulted() const { return faulted_; }
   uint32_t partialsSinceFull() const { return partials_; }
   uint32_t lastRefreshMs() const { return lastMs_; }   // duration of the last completed refresh
+  const Timing &lastTiming() const { return timing_; }
+
+  // STAY POWERED: skip the power-off after a refresh (and so the power-on before the next), for a
+  // run of frequent updates -- a ticking track position. Rails up/down cost ~100-200 ms of every
+  // refresh; the caller turns this off (and calls powerDown()) when the run ends, because the
+  // controller's charge pumps should not sit on for hours.
+  void stayPowered(bool on) { stay_ = on; }
+  bool powered() const { return powered_; }
+  // Take the rails down now if they were left up. Non-blocking (poll() finishes it).
+  bool powerDown() {
+    if (step_ != Step::IDLE || !powered_) return false;
+    full_ = false; clean_ = false; count_ = false;
+    cmd(0x02);
+    enter(Step::OFF_WAIT, 0);
+    return true;
+  }
 
   // Queue a full refresh of `frame` (W*H/8 bytes). Returns false if a refresh is running.
   bool startFull(const uint8_t *frame) {
     if (step_ != Step::IDLE) return false;
-    full_ = true; clean_ = false; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
+    full_ = true; clean_ = false; count_ = true; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
+    xb0_ = 0; xb1_ = ROW;
     cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
     cmd(0x92);                             // leave partial mode, if we were in it
     cmd(0x50, {0x10, 0x07});               // VCOM/data interval: normal polarity (1 = white)
@@ -105,12 +124,19 @@ public:
   // temperature sensor picks) instead of the fast one: it flashes, but only inside the window,
   // and it clears the ghosting that fast partial updates leave behind in those rows. This is
   // what lets a caller clean one busy band (a ticking progress bar) without flashing the rest.
-  bool startPartial(const uint8_t *frame, const uint8_t *prev, int y0, int y1, bool clean = false) {
+  //
+  // `xb0`/`xb1` narrow the window to byte columns [xb0, xb1) (8 pixels each; the controller's
+  // horizontal window is byte-aligned): a ticking progress bar sends and drives only itself.
+  bool startPartial(const uint8_t *frame, const uint8_t *prev, int y0, int y1, bool clean = false,
+                    int xb0 = 0, int xb1 = ROW) {
     if (step_ != Step::IDLE || !prev) return false;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
-    if (y0 >= y1) return false;
-    full_ = false; clean_ = clean; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
+    if (xb0 < 0) xb0 = 0;
+    if (xb1 > ROW) xb1 = ROW;
+    if (y0 >= y1 || xb0 >= xb1) return false;
+    full_ = false; clean_ = clean; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
+    xb0_ = xb0; xb1_ = xb1;
     cmd(0x50, {0xA9, 0x07});               // partial polarity (1 = ink), new->old copy
     if (clean) {
       cmd(0xE0, {0x00});                   // cascade off: the temperature-selected full LUT
@@ -133,19 +159,30 @@ public:
       return;
     }
     switch (step_) {
-      case Step::POWER_WAIT:
+      case Step::POWER_WAIT: {
+        powered_ = true;
+        timing_.power = (uint16_t)(now - started_);
+        const uint32_t t0 = bus_.millis();
         sendAndRefresh();
-        enter(Step::REFRESH_WAIT, 100);
+        timing_.send = (uint16_t)(bus_.millis() - t0);
+        enter(Step::REFRESH_WAIT, SETTLE_MS);
         break;
+      }
       case Step::REFRESH_WAIT:
-        if (!full_) cmd(0x92);             // out of partial mode before powering down
+        timing_.refresh = (uint16_t)(now - stepStart_);
+        if (!full_) cmd(0x92);             // out of partial mode
+        if (stay_ && !full_) {             // a run of updates: leave the rails up
+          timing_.off = 0;
+          finish(now);
+          break;
+        }
         cmd(0x02);                         // power off (keeps registers and RAM)
         enter(Step::OFF_WAIT, 0);
         break;
       case Step::OFF_WAIT:
-        partials_ = full_ ? 0 : partials_ + (clean_ ? 0 : 1);
-        lastMs_ = now - started_;
-        step_ = Step::IDLE;
+        powered_ = false;
+        timing_.off = (uint16_t)(now - stepStart_);
+        finish(now);
         break;
       default:
         step_ = Step::IDLE;
@@ -162,11 +199,15 @@ public:
 private:
   Bus &bus_;
   Step step_ = Step::IDLE;
-  bool full_ = true, clean_ = false, faulted_ = false, invert_ = false;
+  static constexpr uint32_t SETTLE_MS = 5;   // BUSY takes a moment to assert after a command
+  bool full_ = true, clean_ = false, count_ = false, faulted_ = false, invert_ = false;
+  bool stay_ = false, powered_ = false;
+  int xb0_ = 0, xb1_ = ROW;
+  Timing timing_{0, 0, 0, 0};
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
-  uint8_t line_[ROW];
+  uint8_t line_[ROW * 10];
 
   void cmd(uint8_t c) { bus_.command(c); }
   bool waitIdle(uint32_t ms) {             // begin() only: the one place a block is acceptable
@@ -183,6 +224,13 @@ private:
     for (uint8_t b : d) if (n < sizeof tmp) tmp[n++] = b;
     bus_.data(tmp, n);
   }
+  void finish(uint32_t now) {
+    if (count_) {
+      partials_ = full_ ? 0 : partials_ + (clean_ ? 0 : 1);
+      lastMs_ = now - started_;
+    }
+    step_ = Step::IDLE;
+  }
   void enter(Step s, uint32_t settleMs) {
     step_ = s;
     stepStart_ = bus_.millis();
@@ -190,29 +238,36 @@ private:
   }
   void powerOn() {
     started_ = bus_.millis();
+    if (powered_) {                        // rails still up from the last update
+      enter(Step::POWER_WAIT, 0);
+      return;
+    }
     cmd(0x04);                             // power on; BUSY until the rails are up
-    enter(Step::POWER_WAIT, 100);
+    enter(Step::POWER_WAIT, SETTLE_MS);
   }
+  // The window's bytes, row after row, batched into as few bus writes as the buffer allows.
   void sendRows(uint8_t reg, const uint8_t *src, bool invert) {
     cmd(reg);
+    const int n = xb1_ - xb0_;
+    size_t fill = 0;
     for (int y = y0_; y < y1_; y++) {
-      const uint8_t *row = src + (size_t)y * ROW;
-      if (invert) {
-        for (int i = 0; i < ROW; i++) line_[i] = (uint8_t)~row[i];
-        bus_.data(line_, ROW);
-      } else {
-        bus_.data(row, ROW);
-      }
+      const uint8_t *row = src + (size_t)y * ROW + xb0_;
+      if (fill + (size_t)n > sizeof line_) { bus_.data(line_, fill); fill = 0; }
+      if (invert) for (int i = 0; i < n; i++) line_[fill + i] = (uint8_t)~row[i];
+      else memcpy(line_ + fill, row, (size_t)n);
+      fill += (size_t)n;
     }
+    if (fill) bus_.data(line_, fill);
   }
   void sendAndRefresh() {
     if (full_) {
       sendRows(0x13, frame_, !invert_);    // normal polarity: 1 = white
     } else {
       cmd(0x91);                           // partial in
-      const uint16_t x1 = W - 1, ya = (uint16_t)y0_, yb = (uint16_t)(y1_ - 1);
-      cmd(0x90, {0x00, 0x00, (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xFF), (uint8_t)(ya >> 8),
-                 (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), 0x01});
+      const uint16_t xa = (uint16_t)(xb0_ * 8), xe = (uint16_t)(xb1_ * 8 - 1);
+      const uint16_t ya = (uint16_t)y0_, yb = (uint16_t)(y1_ - 1);
+      cmd(0x90, {(uint8_t)(xa >> 8), (uint8_t)(xa & 0xFF), (uint8_t)(xe >> 8), (uint8_t)(xe & 0xFF),
+                 (uint8_t)(ya >> 8), (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), 0x01});
       sendRows(0x10, prev_, invert_);      // what is on the glass (old)
       sendRows(0x13, frame_, invert_);     // what should be (new)
     }
