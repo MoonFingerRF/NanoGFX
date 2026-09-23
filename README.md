@@ -85,6 +85,10 @@ what a small MCU can drive:
   a busy corner gets cleaned on its own instead of flashing the whole screen.
 - **PackRLE images + `tools/packrle.py`** — a whole picture as one blob (rows with length
   prefixes), encoded on a host in pure Python and decoded on the device.
+- **`PackInk`** — textured 1-bit drawing for e-paper art: shapes, curves and text stamped as
+  coverage, then painted with a texture (Bayer, noise, clouds, hatching, halftone dots) and a mode
+  (cover, glaze, erase, invert) through clips and masks. Deterministic, so a host renderer can
+  match it pixel for pixel. See [PackInk](#packink--textured-1-bit-drawing-e-paper-art) below.
 - **`tools/ttf2gfxfont.py`** — any TrueType font as a GFXfont header, no FreeType build needed.
 - **`ST7789`** (ESP32) — the same driver shape for classic 4-wire-SPI TFTs
   (240×240/280/320 modules), with the same split-polling overlap and explicit
@@ -216,6 +220,31 @@ and ESP-IDF builds, plus the format contracts).
   `UC8179` object in internal RAM (its line buffer is what SPI DMA reads).
 - The RM690B0 driver is polling by design; the split calls are the overlap mechanism.
   One transfer in flight at a time; don't touch the buffer until `ramWriteEnd()`.
+
+## PackInk — textured 1-bit drawing (e-paper art)
+
+`#include <PackInk.h>` (header-only, no heap, C++11, no Arduino needed). A second drawing layer
+for 1-bit panels, where an intensity has to become dots *in a chosen way*:
+
+- **`InkBits` / `InkCoverage`** — 1-bit bitmaps in PackMono/UC8179 order (MSB-first, 1 = ink);
+  a coverage is the set of pixels one shape touches plus its pen-stamp count.
+- **Shapes** — `fillRect`/`outlineRect`, `fillEllipse`/`outlineEllipse` (rings by span
+  subtraction), even-odd `fillPoly`, Bresenham `line` stamped with a round pen (1, 2x2, disc),
+  `PolyPen` polylines fed by `quadPoints`/`cubicPoints`/`arcPoints`/`wavePoints`/`spiralPoints`,
+  and the classic 5x7 font at any integer scale in four rotations (`text`).
+- **Textures** (`Pen.texture`, level 0..16, scale `param`): `FLAT` (4x4 Bayer — PackMono's own
+  dither), `NOISE` (white noise), `GATED` (noise only inside smooth random patches), `CLOUD`
+  (bilinear value noise), `HATCH`, `LINES`, `VLINES`, `CROSS`, `DOTS` (halftone).
+- **Modes** — `COVER` (ink and paper: occludes), `GLAZE` (ink only), `ERASE`, `INVERT`; `paint()`
+  takes a clip rectangle, an optional mask bitmap (inside/outside) and a texture offset so a moving
+  layer carries its texture with it.
+- **`blit()`** — an `InkBits` onto any canvas with `drawFastHLine` (PackCanvas included), in runs.
+
+**Determinism is the contract**: integer arithmetic, floor division (`fdiv`) and positive modulo
+(`pmod`) spelled out, one 32-bit hash (`lowbias32`), one copied sine table — so a Python reference
+of the same rules draws identical pixels (`tests/ink_host.cpp` checks pinned numbers from it).
+First user: nightly generative art on a 7.5" e-paper panel (reTerminal E1001).
+Example: `examples/InkArt_Basics`.
 
 ## Provenance
 
