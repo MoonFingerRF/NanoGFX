@@ -208,7 +208,7 @@ static void test_ghost() {
     CHECK(p.kind == EInkGhost::PARTIAL);
     g.done(p); glass = frame;
   }
-  CHECK(g.wear(18) == 8 && g.headroom(16, 24, 10, 30) == 24);
+  CHECK(g.wear(18) == 8 && g.headroom(16, 24, 10, 30) == 24 && g.lastHeadroom() == 24);
   // nothing changed: nothing to do; forced: full
   CHECK(g.plan(glass.data(), frame.data()).kind == EInkGhost::NONE);
   CHECK(g.plan(glass.data(), frame.data(), true).kind == EInkGhost::FULL);

@@ -169,10 +169,18 @@ public:
       }
       return;
     }
-    if (p.kind == PARTIAL)
+    if (p.kind == PARTIAL) {
+      uint16_t m = 0;
       for (size_t i = 0; i < n; i++)
-        if (changed_[i] && wear_[i] < 60000) wear_[i]++;
+        if (changed_[i]) {
+          if (wear_[i] < 60000) wear_[i]++;
+          if (wear_[i] > m) m = wear_[i];
+        }
+      last_max_ = m;
+    }
   }
+  // Partials left in the cells the last PARTIAL changed (the region that just ticked).
+  int lastHeadroom() const { return last_max_ >= budget_ ? 0 : budget_ - last_max_; }
 
 private:
   int h_, rb_, ch_;
@@ -181,6 +189,7 @@ private:
   bool early_ = false;
   uint16_t *wear_;
   uint8_t *changed_;          // this plan's changed cells
+  uint16_t last_max_ = 0;     // the most worn cell of the last PARTIAL
   int clampRow(int y) const { return y < 0 ? 0 : y >= h_ ? h_ - 1 : y; }
   void applyBudget() {
     const float c = temp_;
