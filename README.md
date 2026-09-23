@@ -80,9 +80,10 @@ what a small MCU can drive:
   byte columns; a *clean* window runs the full waveform inside the window only; the rails can
   stay up for a run of 1 Hz updates. Bring your own bus (Arduino SPI, ESP-IDF, ESPHome, a
   simulator).
-- **`EInkGhost`** — **e-paper ghosting policy, per region.** Tracks wear per row (a ticking
-  clock adds a little, a real change adds more) and answers PARTIAL, CLEAN window, or FULL, so
-  a busy corner gets cleaned on its own instead of flashing the whole screen.
+- **`EInkGhost`** — **e-paper ghosting policy, per 8×8 cell.** Counts, per cell, the pixels
+  partial refreshes flipped (in full toggles) and answers PARTIAL, CLEAN window, or FULL; tells a
+  caller how much headroom a ticking region has left so it can pace it until the next full
+  refresh. Budgets from a camera measurement on the UC8179 are in the docs.
 - **PackRLE images + `tools/packrle.py`** — a whole picture as one blob (rows with length
   prefixes), encoded on a host in pure Python and decoded on the device.
 - **`PackInk`** — textured 1-bit drawing for e-paper art: shapes, curves and text stamped as
@@ -159,7 +160,7 @@ Bus bus;
 UC8179<Bus> epd(bus);
 PackCanvas canvas(800, 480, false);   // 192 KB packed: put it in PSRAM
 PackMono mono;                        // palette index -> ink level -> dither
-EInkGhost ghost(480, 100);            // per-row wear -> PARTIAL / CLEAN / FULL
+EInkGhost ghost(480, 100, 80);        // per-cell wear -> PARTIAL / CLEAN / FULL
 uint8_t *frame, *glass;               // 48 KB each: next frame, what the glass shows
 
 void loop() {
@@ -197,7 +198,7 @@ and ESP-IDF builds, plus the format contracts).
   with per-frame stats printed (rows pushed, decode µs, wire µs).
 - **`UC8179_EInk`** (ESP32-S3 + PSRAM) — a 7.5" e-paper panel (pins for the Seeed reTerminal
   E1001): a grey panel dithered by `PackMono`, a 1 Hz progress bar as a tiny partial window,
-  `EInkGhost` choosing clean windows as rows wear, refresh timings on the serial log.
+  `EInkGhost` counting per-cell wear, refresh timings on the serial log.
 
 ## Building
 
