@@ -152,3 +152,28 @@ project (`tools/gfxbench`) proving byte-identical behavior against stock Adafrui
 across formats, rotations, and the text blitter — 2.2M checks per run.
 
 MIT license.
+
+## PackInk — textured 1-bit drawing (e-paper art)
+
+`#include <PackInk.h>` (header-only, no heap, C++11, no Arduino needed). A second drawing layer
+for 1-bit panels, where an intensity has to become dots *in a chosen way*:
+
+- **`InkBits` / `InkCoverage`** — 1-bit bitmaps in PackMono/UC8179 order (MSB-first, 1 = ink);
+  a coverage is the set of pixels one shape touches plus its pen-stamp count.
+- **Shapes** — `fillRect`/`outlineRect`, `fillEllipse`/`outlineEllipse` (rings by span
+  subtraction), even-odd `fillPoly`, Bresenham `line` stamped with a round pen (1, 2x2, disc),
+  `PolyPen` polylines fed by `quadPoints`/`cubicPoints`/`arcPoints`/`wavePoints`/`spiralPoints`,
+  and the classic 5x7 font at any integer scale in four rotations (`text`).
+- **Textures** (`Pen.texture`, level 0..16, scale `param`): `FLAT` (4x4 Bayer — PackMono's own
+  dither), `NOISE` (white noise), `GATED` (noise only inside smooth random patches), `CLOUD`
+  (bilinear value noise), `HATCH`, `LINES`, `VLINES`, `CROSS`, `DOTS` (halftone).
+- **Modes** — `COVER` (ink and paper: occludes), `GLAZE` (ink only), `ERASE`, `INVERT`; `paint()`
+  takes a clip rectangle, an optional mask bitmap (inside/outside) and a texture offset so a moving
+  layer carries its texture with it.
+- **`blit()`** — an `InkBits` onto any canvas with `drawFastHLine` (PackCanvas included), in runs.
+
+**Determinism is the contract**: integer arithmetic, floor division (`fdiv`) and positive modulo
+(`pmod`) spelled out, one 32-bit hash (`lowbias32`), one copied sine table — so a Python reference
+of the same rules draws identical pixels (`tests/ink_host.cpp` checks pinned numbers from it).
+First user: the Nostalgia hub's nightly generative art on a reTerminal E1001.
+Example: `examples/InkArt_Basics`.
