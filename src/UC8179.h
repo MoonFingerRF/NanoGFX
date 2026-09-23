@@ -112,7 +112,7 @@ public:
     xb0_ = 0; xb1_ = ROW;
     cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
     cmd(0x92);                             // leave partial mode, if we were in it
-    cmd(0x50, {0x10, 0x07});               // VCOM/data interval: normal polarity (1 = white)
+    cmd(0x50, {CDI_FULL, 0x07});           // VCOM/data interval; border driven (see CDI_*)
     powerOn();
     return true;
   }
@@ -137,7 +137,7 @@ public:
     if (y0 >= y1 || xb0 >= xb1) return false;
     full_ = false; clean_ = clean; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     xb0_ = xb0; xb1_ = xb1;
-    cmd(0x50, {0xA9, 0x07});               // partial polarity (1 = ink), new->old copy
+    cmd(0x50, {CDI_PARTIAL, 0x07});        // data polarity 1 = ink, new->old copy, border driven
     if (clean) {
       cmd(0xE0, {0x00});                   // cascade off: the temperature-selected full LUT
     } else {
@@ -200,6 +200,13 @@ private:
   Bus &bus_;
   Step step_ = Step::IDLE;
   static constexpr uint32_t SETTLE_MS = 5;   // BUSY takes a moment to assert after a command
+  // CDI (0x50) byte 1: BDZ(7) BDV(5:4) N2OCP(3) DDX(1:0). The border -- the ring of glass
+  // outside the 800x480 active area -- must be DRIVEN on every refresh: Waveshare's partial demo
+  // floats it (BDZ=1, 0xA9), and on a panel whose rails are kept up between updates a floating
+  // border drifts into a grey outline round the picture (seen on a reTerminal E1001, 2026-09-23).
+  // Both refreshes now use the same data polarity (DDX=01) and the same border value (BDV=01).
+  static constexpr uint8_t CDI_FULL = 0x11;      // BDZ=0 BDV=01 N2OCP=0 DDX=01
+  static constexpr uint8_t CDI_PARTIAL = 0x19;   // BDZ=0 BDV=01 N2OCP=1 DDX=01
   bool full_ = true, clean_ = false, count_ = false, faulted_ = false, invert_ = false;
   bool stay_ = false, powered_ = false;
   int xb0_ = 0, xb1_ = ROW;
@@ -261,7 +268,7 @@ private:
   }
   void sendAndRefresh() {
     if (full_) {
-      sendRows(0x13, frame_, !invert_);    // normal polarity: 1 = white
+      sendRows(0x13, frame_, invert_);     // same data polarity as a partial (DDX=01 in both)
     } else {
       cmd(0x91);                           // partial in
       const uint16_t xa = (uint16_t)(xb0_ * 8), xe = (uint16_t)(xb1_ * 8 - 1);
