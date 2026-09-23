@@ -3,18 +3,47 @@
 Complete reference for every public function in the library. One include gets the core:
 
 ```cpp
-#include <NanoGFX.h>    // PackCanvas + PackRLE + PackFlush
+#include <NanoGFX.h>    // PackCanvas + PackRLE + PackFlush + PackMono + EInkGhost
 #include <RM690B0.h>    // (optional, ESP32) QSPI AMOLED driver
+#include <ST7789.h>     // (optional, ESP32) 4-wire SPI TFT driver
+#include <UC8179.h>     // (optional, any MCU) 800x480 e-paper driver, bring your own bus
 ```
 
-Contents: [PackCanvas](#packcanvas) · [PackRLE](#packrle) · [PackFlush](#packflush) ·
-[RM690B0](#rm690b0) · [ST7789](#st7789) · [Formats & contracts](#formats--contracts)
+Contents: [Builds](#builds-arduino-esp-idf-esphome-host) · [PackCanvas](#packcanvas) ·
+[PackRLE](#packrle) · [PackRLE images](#packrle-images) · [PackFlush](#packflush) ·
+[RM690B0](#rm690b0) · [ST7789](#st7789) · [PackMono](#packmono) · [UC8179](#uc8179) ·
+[EInkGhost](#einkghost) · [Tools](#tools) · [Formats & contracts](#formats--contracts)
+
+---
+
+## Builds (Arduino, ESP-IDF, ESPHome, host)
+
+NanoGFX is header-only and builds two ways from the same sources:
+
+- **With Adafruit_GFX** (Arduino, when `<Adafruit_GFX.h>` is on the include path):
+  `PackCanvas` derives from `GFXcanvas8`, exactly as in earlier releases.
+- **Standalone** (ESP-IDF, ESPHome, a desktop compiler; or any build that defines
+  `NANOGFX_STANDALONE`): `PackCanvas` derives from **`NanoGFX_Canvas8`** in `NanoGFXBase.h`, a
+  subset of Adafruit_GFX 1.12 with the same members, virtuals and pixel output (pixels, lines,
+  rects, round rects, circles, triangles, 1-bit bitmaps, the classic 5×7 font, **GFXfont**
+  proportional fonts, `getTextBounds`, `print`/`printf`). Not included: `Print`/`String`,
+  RGB/grayscale bitmaps, `invertDisplay`.
+
+The selection is automatic (`__has_include`). `NGFX_GFX` and `NGFX_CANVAS8` name whichever
+base is in use, for code that calls the base class explicitly.
+
+**ESP-IDF component.** The repo root is a component (`CMakeLists.txt`, `idf_component.yml`).
+Add it with a path dependency — `nanogfx: { path: ../NanoGFX }` in your `idf_component.yml`,
+or `add_idf_component(path=...)` from an ESPHome external component.
+
+**Host.** `tests/host_standalone.cpp` builds with any C++17 compiler:
+`c++ -std=c++17 -Wall -Wextra -I src tests/host_standalone.cpp -o ngfx_host && ./ngfx_host`.
 
 ---
 
 ## PackCanvas
 
-`class PackCanvas : public GFXcanvas8`
+`class PackCanvas : public NGFX_CANVAS8` (`GFXcanvas8` on Arduino, `NanoGFX_Canvas8` standalone)
 
 One canvas class, three storage formats selected **per instance**. Because it derives from
 `Adafruit_GFX`, **every stock GFX call works**: `drawLine`, `drawRect`, `fillRect`,
@@ -231,6 +260,155 @@ RGB565 pair LUT for SPI panels (wire order) vs RGB parallel framebuffers (native
 // RGB fb (LCD_CAM): word =        pal[hi] |        pal[lo] << 16   -> aligned fb stores
 for (int b = 0; b < 256; b++) pair[b] = f(pal[b >> 4]) | (uint32_t)f(pal[b & 15]) << 16;
 ```
+
+---
+
+## PackRLE images
+
+A whole picture as one blob — how a host sends an image (an album cover, an icon) to a
+device. The blob is the rows' PackRLE streams back to back, each prefixed with its byte length
+as a little-endian `uint16`. Width and height travel beside it. Worst case
+`h * (2 + PRLE_STRIDE(w))` bytes. `tools/packrle.py` writes the same format from Python.
+
+| Function | Description |
+|---|---|
+| `size_t prle_image_encode_idx8(const uint8_t *idx, int w, int h, uint8_t *out)` | Encode `w×h` palette indices (one byte each, 0–14). `out` must hold `h * (2 + PRLE_STRIDE(w))` bytes. Returns bytes written. |
+| `bool prle_image_decode_flat(const uint8_t *enc, size_t nb, int w, int h, uint8_t *flat)` | Decode into packed rows of stride `PRLE_STRIDE(w)` — the layout `PackCanvas::drawIndexedBitmap` draws. False on a truncated or malformed blob (rows decoded before the fault are kept). |
+
+```cpp
+static uint8_t flat[96 * PRLE_STRIDE(96)];
+if (prle_image_decode_flat(blob, blobLen, 96, 96, flat))
+  canvas.drawIndexedBitmap(x, y, flat, 96, 96);
+```
+
+---
+
+## PackMono
+
+`PackMono.h`: a packed 4-bit canvas out to a **1-bit panel** (e-paper, mono LCD/OLED).
+Each palette index gets an **ink level** 0–16 (0 = paper, 16 = solid ink); levels in between
+become a 4×4 ordered (Bayer) dither on export. Greys stay flat, compressible palette colours on
+the canvas and only turn into dots on the way out. Default: index 1 = ink, all others paper.
+
+| Function | Description |
+|---|---|
+| `void setLevel(uint8_t index, uint8_t inkLevel)` / `uint8_t getLevel(uint8_t index)` | Ink level of a palette index (clamped to 16). Rebuilds the 2 KB lookup table. |
+| `static size_t rowBytes(int w)` | Output bytes per row, `(w + 7) / 8`. |
+| `void exportRows(PackCanvas &c, uint8_t *out, int y0, int y1, bool inkBit = true, bool mirrorX = false)` | Export rows `[y0, y1)` to `out + y * rowBytes(W)`: MSB-first, x = 0 in bit 7. `inkBit` = the bit value for ink; `mirrorX` flips each row. Canvas must be `packed4` with an even width; rows are flattened first. Cost: one table lookup per 2 pixels (an 800×480 frame is ~190k lookups, a few ms on an ESP32-S3). |
+| `static bool diffRows(const uint8_t *a, const uint8_t *b, int w, int h, int *y0, int *y1)` | The band of rows where two exported frames differ; false when identical. Comparing the 1-bit output means a redraw that lands on the same dots costs nothing. |
+
+**Memory:** 2 KB of lookup table + 16 bytes. The output frame is the caller's
+(`rowBytes(W) * H`, 48 000 bytes at 800×480).
+
+---
+
+## UC8179
+
+`UC8179.h`: `template <class Bus> class UC8179`. Non-blocking driver for **800×480 UC8179
+e-paper**: Seeed reTerminal E1001, Waveshare 7.5" V2, GoodDisplay GDEY075T7. Portable (no
+ESP-IDF or Arduino dependency): you supply the bus.
+
+```cpp
+struct Bus {
+  void command(uint8_t c);                  // DC low, one byte
+  void data(const uint8_t *p, size_t n);    // DC high, n bytes
+  bool busy();                              // true while the panel is busy (mind the polarity)
+  void reset(bool high);                    // drive RST
+  void delayMs(uint32_t ms);                // only used by begin()
+  uint32_t millis();
+};
+```
+
+**Why non-blocking.** An e-paper refresh is up to 4 s of BUSY. Every wait here is a state:
+`start*()` queues a refresh, `poll()` advances it by at most one step and returns at once,
+`isIdle()` says when the glass is done. Only `begin()` (~300 ms) and the SPI pushes block.
+
+**Frames** are 1 bit per pixel, MSB-first, 100 bytes a row, **bit 1 = ink** (what `PackMono`
+exports by default). The driver keeps pointers to your frames; it does not copy them.
+
+| Function | Description |
+|---|---|
+| `explicit UC8179(Bus &bus)` | |
+| `void invert(bool on)` | The glass shows frames negative without it (the reTerminal E1001 does): set once, before `begin()`. Applies to every refresh kind. |
+| `void begin()` | Hard reset + register setup (power, booster, panel setting, 800×480 resolution). Blocking, ~300 ms; each step waits for BUSY. Call again after `faulted()`. |
+| `bool startFull(const uint8_t *frame)` | Queue a full refresh (the flashing waveform the panel picks from its temperature sensor; clears all ghosting). ~4 s. False if a refresh is running. |
+| `bool startPartial(const uint8_t *frame, const uint8_t *prev, int y0, int y1, bool clean = false, int xb0 = 0, int xb1 = 100)` | Queue a refresh of rows `[y0, y1)` × byte columns `[xb0, xb1)` (8 px each; the controller's window is byte-aligned). `prev` = what is on the glass now (also a full frame): its window is re-sent as the "old" image every time, so a partial right after a full refresh compares against the truth. `clean = false`: the fast waveform, no flash. `clean = true`: the full waveform **inside the window only** — that window flashes and its ghosting is cleared. False if busy or the window is empty. |
+| `void poll()` | Advance the running refresh. Cheap; call from your loop. |
+| `bool isIdle()` / `Step step()` | Done? / which wait it is in (`IDLE`, `POWER_WAIT`, `REFRESH_WAIT`, `OFF_WAIT`). |
+| `bool faulted()` | BUSY stayed up past `BUSY_TIMEOUT_MS` (12 s). Call `begin()` again. |
+| `void stayPowered(bool on)` / `bool powered()` / `bool powerDown()` | Keep the charge pumps up between refreshes during a run of frequent updates (a ticking position bar): saves the ~100–200 ms of rails up/down on each. Turn it off and `powerDown()` when the run ends. |
+| `void sleep()` | Deep sleep (lowest power). Needs `begin()` to wake. Only when idle. |
+| `uint32_t partialsSinceFull()` / `uint32_t lastRefreshMs()` / `const Timing &lastTiming()` | Counters for your policy and telemetry. `Timing{power, send, refresh, off}` is where the last refresh spent its time, in ms. |
+
+**Measured** on a reTerminal E1001 (ESP32-S3, SPI 10 MHz): full refresh 4.05 s; full-width
+partial with rails up 1.1–1.2 s; a 104×17 px partial window 0.88 s (SPI 1 ms, waveform 865 ms).
+
+**Border.** Both refresh kinds drive the border (CDI `0x11` full / `0x19` partial). Waveshare's
+partial sequence floats it (`0xA9`); with the rails kept up between updates a floating border
+drifts into a grey outline round the picture.
+
+**Memory:** the driver object is ~1 KB (a 1000-byte line buffer that batches SPI writes). Two
+caller frames of 48 000 bytes (next + on-glass). **ESP32 with PSRAM:** SPI DMA cannot read every
+PSRAM layout; keep the driver object (and so its line buffer) in internal RAM, or have your
+`Bus::data()` copy through an internal DMA-capable buffer. A DMA read the SPI driver cannot do
+reaches the controller as nothing, and the panel refreshes whatever its RAM held before.
+
+---
+
+## EInkGhost
+
+`EInkGhost.h`: which refresh a change deserves, **region by region**. Knows nothing about the
+controller: 1-bit frames in, a `Plan` out.
+
+- `PARTIAL` — fast, no flash, leaves a little ghost behind.
+- `CLEAN` — the full waveform inside a window (`UC8179::startPartial(..., clean = true, ...)`).
+- `FULL` — the whole screen.
+
+It keeps **wear per row**, plus the byte-column extent of what changed in that row. Every
+partial adds wear to the rows it changed: **1** for an *ambient* update (only a self-ticking
+value moved: a clock, a position bar), **`EVENT_WEAR` = 8** for an *event* (new data, a button).
+A change that would push a row past the budget is done as a `CLEAN` window instead, and an event
+landing on rows already a third worn is cleaned while it is redrawn anyway, so the flash comes
+where the eye expects a change.
+
+| Function | Description |
+|---|---|
+| `EInkGhost(int height, int rowBytes, uint16_t budget = 160)` | For an 800×480 panel: `EInkGhost g(480, 100)`. Budget is in wear units (160 = 20 events or 160 ticks). |
+| `Plan plan(const uint8_t *glass, const uint8_t *frame, bool forceFull = false, bool ambient = false)` | What to do to get `frame` onto glass that shows `glass`. `Plan{kind, y0, y1, xb0, xb1}` is the window: rows `[y0, y1)`, byte columns `[xb0, xb1)`. `NONE` when nothing changed. |
+| `void done(const Plan &p)` | The glass finished `p`. Call once per completed refresh, after the `plan()` that produced it. `FULL` forgets all wear; `CLEAN` forgets the wear it covered. |
+| `bool idleClean(Plan *out) const` | A quiet moment: the worn region (rows at ≥ a quarter of the budget) to clean now, if any. |
+| `void setTemperature(float c)` / `uint16_t budget()` / `uint16_t wear(int y)` | Fast waveforms ghost more in the cold: below 18 °C the budget is ⅔, below 10 °C ½. NaN = unknown. |
+
+```cpp
+UC8179<Bus> epd(bus);  EInkGhost ghost(480, 100);  EInkGhost::Plan running{EInkGhost::NONE};
+// loop():
+epd.poll();
+if (!epd.isIdle()) return;
+if (running.kind != EInkGhost::NONE) { ghost.done(running); memcpy(glass, frame, 48000); running.kind = EInkGhost::NONE; }
+if (redrawn) {
+  mono.exportRows(canvas, frame, 0, 480);
+  EInkGhost::Plan p = ghost.plan(glass, frame, false, /*ambient*/ onlyTheClockMoved);
+  if (p.kind == EInkGhost::NONE && quietForMinutes) ghost.idleClean(&p);
+  bool ok = p.kind == EInkGhost::FULL ? epd.startFull(frame)
+          : p.kind != EInkGhost::NONE && epd.startPartial(frame, glass, p.y0, p.y1,
+                                                          p.kind == EInkGhost::CLEAN, p.xb0, p.xb1);
+  if (ok) running = p;
+}
+```
+
+A whole-screen `FULL` now and then is still the caller's choice (pass `forceFull`), e.g. at
+start-up and at the first change after an hour.
+
+**Memory:** `6 × height` bytes (2 880 at 480 rows), from `malloc`.
+
+---
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `tools/packrle.py` | The PackRLE codec in pure Python (standard library only): `encode_row`, `decode_row`, `encode_image`, `decode_image`. For hosts that send pictures to a device. `tests/host_standalone.cpp` can check a blob from it byte for byte (`ngfx_host image.bin W H`). |
+| `tools/ttf2gfxfont.py` | A TrueType/OpenType font as a GFXfont header, needing only Pillow (no FreeType build). Glyphs are rendered without anti-aliasing, for 1-bit panels. `python3 tools/ttf2gfxfont.py Font.ttf 24 --last 0xFF --name Serif24 > Serif24.h`; `--preview out.png` to check it first. |
 
 ---
 

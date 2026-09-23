@@ -23,20 +23,28 @@
 //    };
 //
 //  FRAMES are 1 bit per pixel, MSB-first, 100 bytes per row, bit 1 = INK (the
-//  PackMono default). The driver inverts where the controller wants white = 1.
+//  PackMono default). Both refreshes send the bits with one data polarity (CDI DDX=01);
+//  a glass that comes out negative (the reTerminal E1001 does) sets invert(true).
 //
 //  REFRESH KINDS
 //   - full:    the panel's own full waveform (the flashing one) — clears ghosting.
 //              Register sequence as ESPHome's `7.50inv2`, which is the one measured to
 //              draw on the E1001's glass.
-//   - partial: the fast "only changed pixels" waveform on a row window [y0, y1).
-//              Sequence as Waveshare's EPD_7IN5_V2 partial demo (0x50 A9/07, 0xE0 02,
-//              0xE5 6E, 0x91, 0x90 window), with one addition: the PREVIOUS frame's
+//   - partial: the fast "only changed pixels" waveform on a window: rows [y0, y1),
+//              byte columns [xb0, xb1). Sequence as Waveshare's EPD_7IN5_V2 partial demo
+//              (0xE0 02, 0xE5 6E, 0x91, 0x90 window) except that the border is driven, not
+//              floated (see CDI_*), with one addition: the PREVIOUS frame's
 //              window is written to DTM1 (0x10) every time, so a partial straight after
 //              a full refresh (which leaves DTM1 stale) still compares against what is
 //              really on the glass. Needs the caller's previous frame.
-//  Partial refreshes accumulate ghosting; call full every N partials (the caller's
-//  policy — the driver counts them in partialsSinceFull()).
+//   - clean:   the full waveform inside a partial window: only that window flashes.
+//  Partial refreshes accumulate ghosting. The policy is the caller's: EInkGhost.h keeps
+//  per-row wear and says PARTIAL / CLEAN / FULL; the driver counts partialsSinceFull().
+//
+//  MEMORY: the driver holds pointers to the caller's frames (48 000 bytes each) and a
+//  small line buffer for batching SPI writes. On ESP32 with frames in PSRAM, make sure
+//  the Bus stages data through internal DMA-capable RAM: a DMA transfer straight out of
+//  PSRAM that the SPI driver does not support reaches the controller as nothing.
 // ============================================================================
 #pragma once
 #include <stdint.h>
@@ -56,10 +64,9 @@ public:
 
   explicit UC8179(Bus &bus) : bus_(bus) {}
 
-  // Which way round this glass is. The controller's two data polarities (normal for full
-  // refreshes, 0x50 DDX=01 for partial ones) are fixed, but panels and bring-up code disagree
-  // about which bit is ink; measured on the reTerminal E1001 (camera, 2026-09-23): the
-  // ESPHome `7.50inv2` convention draws it white-on-black, so that board sets invert(true).
+  // Which way round this glass is. Panels and bring-up code disagree about which bit is ink;
+  // measured on the reTerminal E1001 (camera, 2026-09-23): frames sent as they are come out
+  // white-on-black, so that board sets invert(true). Applies to full and partial alike.
   void invert(bool on) { invert_ = on; }
 
   // Hard reset + register setup. Blocking (~300 ms). Call once, and again after a timeout.

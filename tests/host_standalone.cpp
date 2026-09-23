@@ -76,7 +76,7 @@ static void test_mono_export() {
 static void test_prle_image(const char *path, int w, int h) {
   // Round trip in C first.
   std::vector<uint8_t> idx((size_t)w * h);
-  for (size_t i = 0; i < idx.size(); i++) idx[i] = (uint8_t)((i / 7 + (i % w > w / 2)) % 3);
+  for (size_t i = 0; i < idx.size(); i++) idx[i] = (uint8_t)((i / 7 + ((int)(i % w) > w / 2)) % 3);
   std::vector<uint8_t> enc(h * (2 + PRLE_STRIDE(w)));
   size_t n = prle_image_encode_idx8(idx.data(), w, h, enc.data());
   std::vector<uint8_t> flat(h * PRLE_STRIDE(w));
