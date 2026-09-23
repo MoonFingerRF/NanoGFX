@@ -265,10 +265,10 @@ static void test_fast() {
   CHECK(epd.isIdle() && epd.fastActive());
   // a VCOM sweep setting: the code is clamped, the all-zero VCOM table has no frames
   epd.fastVcom(0x05, 1);
-  CHECK(epd.fastVcomCode() == 0x12 && epd.fastVcomTable() == 1);
+  CHECK(epd.fastVcomCode() == 0x0A && epd.fastVcomTable() == 1);
   bus.log.clear();
   CHECK(epd.startFast(b, a, 40, 168, 2, 32, 13));
-  CHECK((*find(0x82))[0] == 0x12 && zero(find(0x20)) && (*find(0x22))[1] == 13);
+  CHECK((*find(0x82))[0] == 0x0A && zero(find(0x20)) && (*find(0x22))[1] == 13);
   while (!epd.isIdle() && guard++ < 30000) { bus.t += 5; epd.poll(); }
   epd.fastVcom(0x26, 0);
   // S4: the next OTP refresh starts from a hardware reset: PSR 0x1F before any refresh command

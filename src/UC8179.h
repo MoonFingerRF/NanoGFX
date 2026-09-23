@@ -176,6 +176,7 @@ public:
   // WK are mirror images (one phase of `frames` at VDL and VDH); VCOM_DC is set explicitly; and the
   // next OTP refresh of any kind begins with a hardware reset + begin() (vendor registers).
   static constexpr uint8_t FAST_VCOM_DC = 0x26;           // -2.00 V (default; see fastVcom)
+  static constexpr uint8_t FAST_VCOM_MIN = 0x0A;          // -0.60 V: the least negative allowed
   static constexpr uint8_t FAST_CDI = 0x39;               // BDZ=0 BDV=11 (LUTBD) N2OCP=1 DDX=01
   static constexpr uint8_t LVL_TO_WHITE = 0x80;           // phase 0 = 10b: VDL (K->W)
   static constexpr uint8_t LVL_TO_BLACK = 0x40;           // phase 0 = 01b: VDH (W->K)
@@ -218,10 +219,10 @@ public:
   bool fastActive() const { return regLut_; }
 
   // The fast path's VCOM (research S3). VDCS code (0x82): V = -0.10 - 0.05 * code; limited to
-  // 0x12..0x40 (-1.00 .. -3.30 V). `table`: 0 = the VCOM LUT holds VCOM_DC for the phase (default),
+  // FAST_VCOM_MIN..0x40 (-0.60 .. -3.30 V) for the long-form sweep of 2026-09-23. `table`: 0 = the VCOM LUT holds VCOM_DC for the phase (default),
   // 1 = an all-zero VCOM LUT (no VCOM group at all). Floating (11b) is never used.
   void fastVcom(uint8_t code, uint8_t table = 0) {
-    fastVcom_ = code < 0x12 ? 0x12 : code > 0x40 ? 0x40 : code;
+    fastVcom_ = code < FAST_VCOM_MIN ? FAST_VCOM_MIN : code > 0x40 ? 0x40 : code;
     fastVcomTable_ = table ? 1 : 0;
   }
   uint8_t fastVcomCode() const { return fastVcom_; }
