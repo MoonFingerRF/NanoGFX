@@ -307,6 +307,15 @@ static void test_fast() {
     while (!epd.isIdle() && guard++ < 99999) { bus.t += 5; epd.poll(); }
   }
   epd.offBeforeReset(true);
+  // the null refresh: VCOM driven at VCOM_DC, every source LUT zero, no pixel data change
+  while (!epd.isIdle() && guard++ < 99999) { bus.t += 5; epd.poll(); }
+  bus.log.clear();
+  const uint32_t rails = epd.railCycles();
+  CHECK(epd.startNull(a, 0, 8, 0, 1, 4));
+  auto n20 = find(0x20), n22 = find(0x22), n23 = find(0x23);
+  CHECK(n20 && (*n20)[0] == 0x00 && (*n20)[1] == 4 && (*n20)[5] == 1);
+  CHECK(zero(n22) && zero(n23) && zero(find(0x21)) && zero(find(0x24)) && zero(find(0x25)));
+  CHECK(epd.railCycles() == rails + (epd.powered() ? 0 : 1));
 }
 
 int main(int argc, char **argv) {

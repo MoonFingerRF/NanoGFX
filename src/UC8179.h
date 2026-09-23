@@ -234,6 +234,37 @@ public:
     powerOn();
     return true;
   }
+  // NULL refresh (research 2026-09-23 F3/X3): a register-LUT refresh that drives no pixel -- every
+  // source LUT zero (GND), the VCOM LUT at VCOM_DC (level 00) for `frames` -- over the window of
+  // `glass` (old = new = what is on the glass). The panel scans every row (PT_SCAN=1), so every
+  // pixel's storage is rewritten at GND against a DRIVEN common electrode: a reference reset
+  // between the factory and the fast path. S1/S2 hold trivially (nothing is driven).
+  bool startNull(const uint8_t *glass, int y0, int y1, int xb0, int xb1, uint8_t frames) {
+    if (step_ != Step::IDLE || !glass || frames == 0 || frames > FAST_MAX_FRAMES) return false;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (xb0 < 0) xb0 = 0;
+    if (xb1 > ROW) xb1 = ROW;
+    if (y0 >= y1 || xb0 >= xb1) return false;
+    full_ = false; clean_ = false; count_ = true; frame_ = glass; prev_ = glass; y0_ = y0; y1_ = y1;
+    xb0_ = xb0; xb1_ = xb1;
+    uint8_t t60[60], t42[42];
+    cmd(0x00, {0x3F});
+    cmd(0x82, {fastVcom_});
+    cmd(0x50, {FAST_CDI, 0x07});
+    cmd(0xE0, {0x00});
+    fastLut(t60, 60, 0x00, frames); cmdData(0x20, t60, 60);    // VCOM_DC, driven, `frames`
+    fastLut(t42, 42, 0x00, 0);      cmdData(0x21, t42, 42);
+    fastLut(t60, 60, 0x00, 0);      cmdData(0x22, t60, 60);
+    fastLut(t60, 60, 0x00, 0);      cmdData(0x23, t60, 60);
+    fastLut(t60, 60, 0x00, 0);      cmdData(0x24, t60, 60);
+    fastLut(t42, 42, 0x00, 0);      cmdData(0x25, t42, 42);
+    regLut_ = true;
+    powerOn();
+    return true;
+  }
+  // Rail power-ups since begin() (research S9: rail cycles are counted per session).
+  uint32_t railCycles() const { return railCycles_; }
   bool fastActive() const { return regLut_; }
 
   // The fast path's VCOM (research S3). VDCS code (0x82): V = -0.10 - 0.05 * code; limited to
@@ -319,6 +350,7 @@ private:
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
   int factoryVcom_ = -1;
+  uint32_t railCycles_ = 0;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
@@ -361,6 +393,7 @@ private:
       enter(Step::POWER_WAIT, 0);
       return;
     }
+    railCycles_++;
     cmd(0x04);                             // power on; BUSY until the rails are up
     enter(Step::POWER_WAIT, SETTLE_MS);
   }
