@@ -1,0 +1,3 @@
+version: "1.4.0"
+description: "15-color packed-nibble graphics: PackCanvas, PackRLE, PackFlush, PackMono, UC8179/ST7789/RM690B0 drivers"
+url: https://github.com/MoonFingerRF/NanoGFX

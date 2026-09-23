@@ -54,17 +54,29 @@ public:
 
   explicit UC8179(Bus &bus) : bus_(bus) {}
 
-  // Hard reset + register setup. Blocking (~60 ms). Call once, and again after a timeout.
+  // Which way round this glass is. The controller's two data polarities (normal for full
+  // refreshes, 0x50 DDX=01 for partial ones) are fixed, but panels and bring-up code disagree
+  // about which bit is ink; measured on the reTerminal E1001 (camera, 2026-09-23): the
+  // ESPHome `7.50inv2` convention draws it white-on-black, so that board sets invert(true).
+  void invert(bool on) { invert_ = on; }
+
+  // Hard reset + register setup. Blocking (~300 ms). Call once, and again after a timeout.
+  // The controller is BUSY for a while after RST rises and ignores commands until it lets go,
+  // so the reset is long (the Waveshare/ESPHome 200 ms) and every step waits for BUSY: a panel
+  // that silently dropped its panel-setting and resolution writes still refreshes -- showing
+  // whatever its RAM held before -- which looks exactly like "the data never arrived".
   void begin() {
     bus_.reset(true);  bus_.delayMs(20);
-    bus_.reset(false); bus_.delayMs(4);
+    bus_.reset(false); bus_.delayMs(200);
     bus_.reset(true);  bus_.delayMs(20);
+    waitIdle(1000);
     cmd(0x01, {0x07, 0x07, 0x3F, 0x3F});   // power setting: VGH/VGL, VDH/VDL 15 V
     cmd(0x06, {0x17, 0x17, 0x28, 0x17});   // booster soft start
     cmd(0x00, {0x1F});                     // panel setting: KW mode, LUT from OTP
     cmd(0x61, {0x03, 0x20, 0x01, 0xE0});   // resolution 800 x 480
     cmd(0x15, {0x00});                     // dual SPI off
     cmd(0x60, {0x22});                     // TCON
+    waitIdle(1000);
     step_ = Step::IDLE;
     faulted_ = false;
   }
@@ -141,13 +153,20 @@ public:
 private:
   Bus &bus_;
   Step step_ = Step::IDLE;
-  bool full_ = true, faulted_ = false;
+  bool full_ = true, faulted_ = false, invert_ = false;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
   uint8_t line_[ROW];
 
   void cmd(uint8_t c) { bus_.command(c); }
+  bool waitIdle(uint32_t ms) {             // begin() only: the one place a block is acceptable
+    for (uint32_t t = 0; bus_.busy(); t += 5) {
+      if (t >= ms) return false;
+      bus_.delayMs(5);
+    }
+    return true;
+  }
   void cmd(uint8_t c, std::initializer_list<uint8_t> d) {
     bus_.command(c);
     uint8_t tmp[12];
@@ -179,14 +198,14 @@ private:
   }
   void sendAndRefresh() {
     if (full_) {
-      sendRows(0x13, frame_, true);        // normal polarity: 1 = white
+      sendRows(0x13, frame_, !invert_);    // normal polarity: 1 = white
     } else {
       cmd(0x91);                           // partial in
       const uint16_t x1 = W - 1, ya = (uint16_t)y0_, yb = (uint16_t)(y1_ - 1);
       cmd(0x90, {0x00, 0x00, (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xFF), (uint8_t)(ya >> 8),
                  (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), 0x01});
-      sendRows(0x10, prev_, false);        // what is on the glass (old)
-      sendRows(0x13, frame_, false);       // what should be (new)
+      sendRows(0x10, prev_, invert_);      // what is on the glass (old)
+      sendRows(0x13, frame_, invert_);     // what should be (new)
     }
     cmd(0x12);                             // display refresh
   }
