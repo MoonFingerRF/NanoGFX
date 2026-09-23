@@ -49,6 +49,8 @@ public:
     flips_ = (uint16_t *) calloc(n, sizeof(uint16_t));
   }
   ~EInkGhost() { free(wear_); free(flips_); }
+  // False when the constructor could not allocate its tables: nothing else may be called then.
+  bool ok() const { return wear_ != nullptr && flips_ != nullptr; }
 
   // Room temperature in C: below 18 C the budget is two thirds, below 10 C half. NaN: unknown.
   void setTemperature(float c) {
