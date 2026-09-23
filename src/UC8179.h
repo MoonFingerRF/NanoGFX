@@ -175,7 +175,7 @@ public:
   // Safety (research S1-S4): unchanged pixels (WW, KK) and the border (BD) are never driven; KW and
   // WK are mirror images (one phase of `frames` at VDL and VDH); VCOM_DC is set explicitly; and the
   // next OTP refresh of any kind begins with a hardware reset + begin() (vendor registers).
-  static constexpr uint8_t FAST_VCOM_DC = 0x26;           // -2.00 V
+  static constexpr uint8_t FAST_VCOM_DC = 0x26;           // -2.00 V (default; see fastVcom)
   static constexpr uint8_t FAST_CDI = 0x39;               // BDZ=0 BDV=11 (LUTBD) N2OCP=1 DDX=01
   static constexpr uint8_t LVL_TO_WHITE = 0x80;           // phase 0 = 10b: VDL (K->W)
   static constexpr uint8_t LVL_TO_BLACK = 0x40;           // phase 0 = 01b: VDH (W->K)
@@ -202,10 +202,10 @@ public:
     xb0_ = xb0; xb1_ = xb1;
     uint8_t t60[60], t42[42];
     cmd(0x00, {0x3F});                     // PSR: LUT from register, KW mode (rest as vendor 0x1F)
-    cmd(0x82, {FAST_VCOM_DC});             // S3: VCOM_DC explicit
+    cmd(0x82, {fastVcom_});                // S3: VCOM_DC explicit
     cmd(0x50, {FAST_CDI, 0x07});           // border -> LUTBD (all zero: not driven)
     cmd(0xE0, {0x00});                     // no forced temperature
-    fastLut(t60, 60, 0x00, frames); cmdData(0x20, t60, 60);    // VCOM at VCOM_DC for the phase
+    fastLut(t60, 60, 0x00, fastVcomTable_ ? 0 : frames); cmdData(0x20, t60, 60);   // VCOM (see fastVcom)
     fastLut(t42, 42, 0x00, 0);      cmdData(0x21, t42, 42);    // WW: never driven (S1)
     fastLut(t60, 60, LVL_TO_WHITE, frames); cmdData(0x22, t60, 60);   // KW: VDL
     fastLut(t60, 60, LVL_TO_BLACK, frames); cmdData(0x23, t60, 60);   // WK: VDH (mirror, S2)
@@ -216,6 +216,16 @@ public:
     return true;
   }
   bool fastActive() const { return regLut_; }
+
+  // The fast path's VCOM (research S3). VDCS code (0x82): V = -0.10 - 0.05 * code; limited to
+  // 0x12..0x40 (-1.00 .. -3.30 V). `table`: 0 = the VCOM LUT holds VCOM_DC for the phase (default),
+  // 1 = an all-zero VCOM LUT (no VCOM group at all). Floating (11b) is never used.
+  void fastVcom(uint8_t code, uint8_t table = 0) {
+    fastVcom_ = code < 0x12 ? 0x12 : code > 0x40 ? 0x40 : code;
+    fastVcomTable_ = table ? 1 : 0;
+  }
+  uint8_t fastVcomCode() const { return fastVcom_; }
+  uint8_t fastVcomTable() const { return fastVcomTable_; }
 
   // Advance the running refresh by at most one step. Cheap when idle or still busy.
   void poll() {
@@ -282,6 +292,7 @@ private:
   Timing timing_{0, 0, 0, 0};
   uint8_t partialTemp_ = 0x6E;
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
+  uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
