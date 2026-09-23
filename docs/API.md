@@ -358,27 +358,51 @@ reaches the controller as nothing, and the panel refreshes whatever its RAM held
 
 ## EInkGhost
 
-`EInkGhost.h`: which refresh a change deserves, **region by region**. Knows nothing about the
+`EInkGhost.h`: which refresh a change deserves, **cell by cell**. Knows nothing about the
 controller: 1-bit frames in, a `Plan` out.
 
 - `PARTIAL` — fast, no flash, leaves a little ghost behind.
 - `CLEAN` — the full waveform inside a window (`UC8179::startPartial(..., clean = true, ...)`).
 - `FULL` — the whole screen.
 
-It keeps **wear per row**, plus the byte-column extent of what changed in that row. Every
-partial adds wear to the rows it changed: **1** for an *ambient* update (only a self-ticking
-value moved: a clock, a position bar), **`EVENT_WEAR` = 8** for an *event* (new data, a button).
-A change that would push a row past the budget is done as a `CLEAN` window instead, and an event
-landing on rows already a third worn is cleaned while it is redrawn anyway, so the flash comes
-where the eye expects a change.
+**Wear is counted per 8×8 cell** (one byte column × 8 rows), in **full toggles**: every pixel a
+partial refresh flips adds 1/64 to its cell. A progress bar that moves one pixel a tick wears its
+edge cell by 1/64 a tick; an art frame wears the cells its dirty rectangle changed by how much of
+them it flipped. A change whose changed cells would pass the budget is done as a `CLEAN` window over those
+cells (snapped to whole cells) — never a full refresh. (v1 counted per row, and charged a one-pixel
+tick like a redraw of the whole row.) Early cleaning of an event on a third-worn cell is opt-in
+(`setEarlyClean`), off by default.
 
 | Function | Description |
 |---|---|
-| `EInkGhost(int height, int rowBytes, uint16_t budget = 160)` | For an 800×480 panel: `EInkGhost g(480, 100)`. Budget is in wear units (160 = 20 events or 160 ticks). |
+| `EInkGhost(int height, int rowBytes, uint16_t budget = 160)` | For an 800×480 panel: `EInkGhost g(480, 100, 80)`. Budget = **full toggles** a cell takes before it is cleaned (a partial that flips k of a cell's 64 pixels costs k/64). |
 | `Plan plan(const uint8_t *glass, const uint8_t *frame, bool forceFull = false, bool ambient = false)` | What to do to get `frame` onto glass that shows `glass`. `Plan{kind, y0, y1, xb0, xb1}` is the window: rows `[y0, y1)`, byte columns `[xb0, xb1)`. `NONE` when nothing changed. |
-| `void done(const Plan &p)` | The glass finished `p`. Call once per completed refresh, after the `plan()` that produced it. `FULL` forgets all wear; `CLEAN` forgets the wear it covered. |
-| `bool idleClean(Plan *out) const` | A quiet moment: the worn region (rows at ≥ a quarter of the budget) to clean now, if any. |
-| `void setTemperature(float c)` / `uint16_t budget()` / `uint16_t wear(int y)` | Fast waveforms ghost more in the cold: below 18 °C the budget is ⅔, below 10 °C ½. NaN = unknown. |
+| `void done(const Plan &p)` | The glass finished `p`. Call once per completed refresh, after the `plan()` that produced it. `FULL` forgets all wear; `CLEAN` forgets the cells wholly inside its window; `PARTIAL` wears the cells it changed. |
+| `int headroom(y0, y1, xb0, xb1)` / `int lastHeadroom()` | Full toggles a rectangle takes before its most worn cell reaches the budget / how many more partials *like the last one* its most worn changed cell takes. For a caller that **paces a ticking region** so its budget lasts until the next scheduled `FULL`. |
+| `uint16_t maxWear()` / `uint16_t wear(int y)` | The most worn cell overall / in row `y`'s cell row. |
+| `bool idleClean(Plan *out, float share = 0.25)` | The worn region (cells at ≥ `share` of the budget) a quiet screen could clean. |
+| `void setBudget(uint16_t)` / `void setTemperature(float c)` / `uint16_t budget()` | Fast waveforms ghost more in the cold: below 18 °C the budget is ⅔, below 10 °C ½. NaN = unknown. |
+| `void setEarlyClean(bool)` | Clean an event's cells when they are already a third worn (a flash while it redraws anyway). Off by default. |
+
+**Ghosting, measured** on a reTerminal E1001 (UC8179 fast partial waveform, ~23 °C, 2026-09-23).
+Blocks of 208×80 px were flipped between two checkerboards (every pixel flips every time: one full
+toggle per refresh), then drawn white, and a camera compared them with an untouched white block:
+
+| Full toggles | Grey vs. untouched white (0–255 camera levels) |
+|---|---|
+| 2 / 10 / 20 | ≈ 0 (clean) |
+| 40 | +3 |
+| 80 | +6 to +7 (faint) |
+| 160 | +10 (a visible grey block) |
+| 360 / 480 | +11 / +13 |
+
+No pattern ghost appeared at any count: the fast waveform leaves a flat grey, which a full refresh
+removes. Two cheaper cleans were measured and rejected: a *scrub* (the region's inverse, then the
+true image, both fast) left it about 29 levels darker; a *clean window* (the full waveform inside
+the window, 4.0 s) made its window whiter than before but greyed the REST of the glass by about 20.
+So on this controller the least visible policy is: count wear in full toggles, keep the busiest
+region under ~80 between whole-screen refreshes (pace its updates if needed: `lastHeadroom()`), and
+let the one full refresh an hour be the only clean.
 
 ```cpp
 UC8179<Bus> epd(bus);  EInkGhost ghost(480, 100);  EInkGhost::Plan running{EInkGhost::NONE};
@@ -400,7 +424,7 @@ if (redrawn) {
 A whole-screen `FULL` now and then is still the caller's choice (pass `forceFull`), e.g. at
 start-up and at the first change after an hour.
 
-**Memory:** `6 × height` bytes (2 880 at 480 rows), from `malloc`.
+**Memory:** 6 bytes per cell (36 000 bytes for 800×480), from `malloc`.
 
 ---
 

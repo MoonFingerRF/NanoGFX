@@ -4,7 +4,7 @@
 // GoodDisplay GDEY075T7) driven the NanoGFX way:
 //
 //   PackCanvas (4-bit, 15 palette indices)  ->  PackMono (greys become a 4x4 dither)
-//     ->  EInkGhost (PARTIAL / CLEAN window / FULL, from per-row wear)
+//     ->  EInkGhost (PARTIAL / CLEAN window / FULL, from per-cell wear)
 //       ->  UC8179 (non-blocking: loop() never waits for the glass)
 //
 // A progress bar ticks once a second (an "ambient" change: a tiny partial window, no
@@ -48,7 +48,7 @@ Bus bus;
 UC8179<Bus> epd(bus);
 PackCanvas canvas(W, H, false);                // buffer supplied from PSRAM below
 PackMono mono;
-EInkGhost ghost(H, ROW);
+EInkGhost ghost(H, ROW, 80);                 // 80 full toggles a cell (measured on a UC8179)
 uint8_t *frame, *glass;                        // 1-bit: what should be / what is on the glass
 EInkGhost::Plan running{EInkGhost::NONE, 0, 0, 0, 0};
 bool firstFrame = true;
