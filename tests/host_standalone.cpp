@@ -290,6 +290,23 @@ static void test_fast() {
   bus.log.clear();
   CHECK(epd.startFull(a) && !epd.fastActive());
   CHECK(!bus.log.empty() && bus.log[0].first == 0x01);                         // begin() came first
+  while (!epd.isIdle() && guard++ < 70000) { bus.t += 5; epd.poll(); }
+  // leaving fast with the rails still up: power off (0x02) BEFORE the reset, unless disabled
+  for (int fix = 1; fix >= 0; fix--) {
+    epd.offBeforeReset(fix == 1);
+    epd.stayPowered(true);
+    CHECK(epd.startFast(b, a, 40, 168, 2, 32, 10));
+    while (!epd.isIdle() && guard++ < 90000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.powered());
+    bus.log.clear();
+    CHECK(epd.startPartial(b, a, 0, 8) && !epd.fastActive());
+    CHECK(!bus.log.empty() && bus.log[0].first == (fix ? 0x02 : 0x01));
+    while (!epd.isIdle() && guard++ < 99000) { bus.t += 5; epd.poll(); }
+    epd.stayPowered(false);
+    epd.powerDown();
+    while (!epd.isIdle() && guard++ < 99999) { bus.t += 5; epd.poll(); }
+  }
+  epd.offBeforeReset(true);
 }
 
 int main(int argc, char **argv) {

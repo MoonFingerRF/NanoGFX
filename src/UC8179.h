@@ -98,6 +98,22 @@ public:
     regLut_ = false;                       // and every register is the vendor's again
   }
 
+  // S4 exit: back to the vendor's registers after a fast (register-LUT) refresh. With the rails
+  // still up (stayPowered), a bare reset drops them WITHOUT the controller's power-off sequence,
+  // and every such cut leaves a little DC on the whole glass at the fast VCOM (measured: fast
+  // frames between factory partials greyed untouched glass by +34 levels in 30 min). So power off
+  // properly first (0x02, BUSY), then reset. offBeforeReset(false) restores the old bare reset,
+  // for the bench's A/B only.
+  void offBeforeReset(bool on) { offBeforeReset_ = on; }
+  void leaveFast() {
+    if (powered_ && offBeforeReset_) {
+      cmd(0x02);
+      waitIdle(1000);
+      powered_ = false;
+    }
+    begin();
+  }
+
   bool isIdle() const { return step_ == Step::IDLE; }
   Step step() const { return step_; }
   bool faulted() const { return faulted_; }
@@ -123,7 +139,7 @@ public:
   // Queue a full refresh of `frame` (W*H/8 bytes). Returns false if a refresh is running.
   bool startFull(const uint8_t *frame) {
     if (step_ != Step::IDLE) return false;
-    if (regLut_) begin();                  // S4: an OTP refresh starts from the vendor's registers
+    if (regLut_) leaveFast();              // S4: an OTP refresh starts from the vendor's registers
     full_ = true; clean_ = false; count_ = true; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
     xb0_ = 0; xb1_ = ROW;
     cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
@@ -151,7 +167,7 @@ public:
     if (xb0 < 0) xb0 = 0;
     if (xb1 > ROW) xb1 = ROW;
     if (y0 >= y1 || xb0 >= xb1) return false;
-    if (regLut_) begin();                  // S4: an OTP refresh starts from the vendor's registers
+    if (regLut_) leaveFast();              // S4: an OTP refresh starts from the vendor's registers
     full_ = false; clean_ = clean; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     xb0_ = xb0; xb1_ = xb1;
     cmd(0x50, {CDI_PARTIAL, 0x07});        // data polarity 1 = ink, new->old copy, border driven
@@ -292,6 +308,7 @@ private:
   int xb0_ = 0, xb1_ = ROW;
   Timing timing_{0, 0, 0, 0};
   uint8_t partialTemp_ = 0x6E;
+  bool offBeforeReset_ = true;  // leaveFast(): power off before the S4 reset
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
