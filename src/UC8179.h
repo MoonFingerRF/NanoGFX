@@ -145,6 +145,7 @@ public:
     cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
     cmd(0x92);                             // leave partial mode, if we were in it
     cmd(0x50, {CDI_FULL, 0x07});           // VCOM/data interval; border driven (see CDI_*)
+    if (factoryVcom_ >= 0) cmd(0x82, {(uint8_t) factoryVcom_});   // bench only (factoryVcom)
     powerOn();
     return true;
   }
@@ -171,6 +172,7 @@ public:
     full_ = false; clean_ = clean; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     xb0_ = xb0; xb1_ = xb1;
     cmd(0x50, {CDI_PARTIAL, 0x07});        // data polarity 1 = ink, new->old copy, border driven
+    if (factoryVcom_ >= 0) cmd(0x82, {(uint8_t) factoryVcom_});   // bench only (factoryVcom)
     if (clean) {
       cmd(0xE0, {0x00});                   // cascade off: the temperature-selected full LUT
     } else {
@@ -242,6 +244,11 @@ public:
     fastVcomTable_ = table ? 1 : 0;
   }
   uint8_t fastVcomCode() const { return fastVcom_; }
+  // BENCH: write VDCS explicitly (same clamp as fastVcom) on the factory (OTP) path too; -1 = never
+  // (the vendor's value after reset, the default). For the mixed-refresh drift investigation.
+  void factoryVcom(int code) {
+    factoryVcom_ = code < 0 ? -1 : code < FAST_VCOM_MIN ? FAST_VCOM_MIN : code > 0x40 ? 0x40 : code;
+  }
   uint8_t fastVcomTable() const { return fastVcomTable_; }
 
   // Advance the running refresh by at most one step. Cheap when idle or still busy.
@@ -311,6 +318,7 @@ private:
   bool offBeforeReset_ = true;  // leaveFast(): power off before the S4 reset
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
+  int factoryVcom_ = -1;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
