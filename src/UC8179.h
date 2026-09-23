@@ -90,7 +90,7 @@ public:
   // Queue a full refresh of `frame` (W*H/8 bytes). Returns false if a refresh is running.
   bool startFull(const uint8_t *frame) {
     if (step_ != Step::IDLE) return false;
-    full_ = true; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
+    full_ = true; clean_ = false; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
     cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
     cmd(0x92);                             // leave partial mode, if we were in it
     cmd(0x50, {0x10, 0x07});               // VCOM/data interval: normal polarity (1 = white)
@@ -100,15 +100,24 @@ public:
 
   // Queue a partial refresh of rows [y0, y1) of `frame`, where `prev` holds what is on the
   // glass now (both full frames; only the window is sent). Returns false if busy.
-  bool startPartial(const uint8_t *frame, const uint8_t *prev, int y0, int y1) {
+  //
+  // `clean` = the same window, driven with the panel's FULL waveform (the one the internal
+  // temperature sensor picks) instead of the fast one: it flashes, but only inside the window,
+  // and it clears the ghosting that fast partial updates leave behind in those rows. This is
+  // what lets a caller clean one busy band (a ticking progress bar) without flashing the rest.
+  bool startPartial(const uint8_t *frame, const uint8_t *prev, int y0, int y1, bool clean = false) {
     if (step_ != Step::IDLE || !prev) return false;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
     if (y0 >= y1) return false;
-    full_ = false; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
+    full_ = false; clean_ = clean; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     cmd(0x50, {0xA9, 0x07});               // partial polarity (1 = ink), new->old copy
-    cmd(0xE0, {0x02});                     // cascade on:
-    cmd(0xE5, {0x6E});                     //   the fast partial waveform
+    if (clean) {
+      cmd(0xE0, {0x00});                   // cascade off: the temperature-selected full LUT
+    } else {
+      cmd(0xE0, {0x02});                   // cascade on:
+      cmd(0xE5, {0x6E});                   //   the fast partial waveform
+    }
     powerOn();
     return true;
   }
@@ -134,7 +143,7 @@ public:
         enter(Step::OFF_WAIT, 0);
         break;
       case Step::OFF_WAIT:
-        partials_ = full_ ? 0 : partials_ + 1;
+        partials_ = full_ ? 0 : partials_ + (clean_ ? 0 : 1);
         lastMs_ = now - started_;
         step_ = Step::IDLE;
         break;
@@ -153,7 +162,7 @@ public:
 private:
   Bus &bus_;
   Step step_ = Step::IDLE;
-  bool full_ = true, faulted_ = false, invert_ = false;
+  bool full_ = true, clean_ = false, faulted_ = false, invert_ = false;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;

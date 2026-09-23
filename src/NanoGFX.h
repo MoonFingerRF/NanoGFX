@@ -12,6 +12,7 @@
 //                  row's encoded stream and push only the rows that changed.
 //    PackMono    — export to a 1-bit panel: per-index ink levels become a 4x4
 //                  ordered dither; diffRows() finds an e-paper partial window.
+//    EInkGhost   — per-row e-paper wear: partial vs. clean-window vs. full.
 //
 //  Builds with Adafruit_GFX (Arduino) or without it (ESP-IDF, ESPHome, host):
 //  NanoGFXBase.h stands in when Adafruit_GFX.h is absent or NANOGFX_STANDALONE
@@ -34,3 +35,4 @@
 #include "PackCanvas.h"
 #include "PackFlush.h"
 #include "PackMono.h"
+#include "EInkGhost.h"
