@@ -7,12 +7,13 @@ Complete reference for every public function in the library. One include gets th
 #include <RM690B0.h>    // (optional, ESP32) QSPI AMOLED driver
 #include <ST7789.h>     // (optional, ESP32) 4-wire SPI TFT driver
 #include <UC8179.h>     // (optional, any MCU) 800x480 e-paper driver, bring your own bus
+#include <PackInk.h>    // (optional, any MCU) textured 1-bit drawing for e-paper art
 ```
 
 Contents: [Builds](#builds-arduino-esp-idf-esphome-host) · [PackCanvas](#packcanvas) ·
 [PackRLE](#packrle) · [PackRLE images](#packrle-images) · [PackFlush](#packflush) ·
 [RM690B0](#rm690b0) · [ST7789](#st7789) · [PackMono](#packmono) · [UC8179](#uc8179) ·
-[EInkGhost](#einkghost) · [Tools](#tools) · [Formats & contracts](#formats--contracts)
+[EInkGhost](#einkghost) · [PackInk](#packink) · [Tools](#tools) · [Formats & contracts](#formats--contracts)
 
 ---
 
@@ -400,6 +401,70 @@ A whole-screen `FULL` now and then is still the caller's choice (pass `forceFull
 start-up and at the first change after an hour.
 
 **Memory:** `6 × height` bytes (2 880 at 480 rows), from `malloc`.
+
+---
+
+## PackInk
+
+`PackInk.h`, namespace `packink`: textured **1-bit drawing** for e-paper pictures. Header-only,
+C++11, no heap (the caller owns every buffer), no Arduino. Independent of `PackCanvas`: it draws
+into its own 1-bit bitmaps and `blit()`s the result onto any canvas.
+
+A shape is drawn in two steps: **rasterise** it into an `InkCoverage` (which pixels it touches),
+then **`paint()`** that coverage into the picture with a `Pen` (texture, level, mode, seed).
+
+**Determinism is the contract.** Integer arithmetic only, floor division (`fdiv`) and positive
+modulo (`pmod`) written out, one 32-bit hash (`mix`, lowbias32), one sine table (`sin1024`). A
+host-side reference of the same rules draws identical pixels; `tests/ink_host.cpp` checks pinned
+numbers from it.
+
+**Bitmaps**
+
+| Type / function | Description |
+|---|---|
+| `struct InkBits { int16_t w, h, stride; uint8_t *bits; }` | 1-bit bitmap, MSB-first rows of `(w+7)/8` bytes, **1 = ink** (the `PackMono` / `UC8179` order). `InkBits(w, h, buf)` wraps a caller buffer of `InkBits::bytesFor(w, h)` bytes. `clear()`, `get(x, y)`, `put(x, y, ink)`, `flip(x, y)`, `span(y, x0, x1)`, `orWith(other)`. |
+| `struct InkCoverage : InkBits { uint32_t stamps; }` | The pixels one shape covers, plus how many pen stamps it took (a render budget can count both). `reset()` before each shape. |
+
+**Shapes** (all add to an `InkCoverage`; coordinates are integers, anything off the bitmap is clipped)
+
+| Function | Description |
+|---|---|
+| `fillRect(c, x, y, w, h)` / `outlineRect(c, x, y, w, h, s)` | Rectangle, filled or with a border `s` px thick. |
+| `fillEllipse(c, cx, cy, rx, ry)` / `outlineEllipse(c, cx, cy, rx, ry, s)` | Ellipse; the outline is a ring (outer minus inner spans), so it never has gaps. |
+| `fillPoly(c, pts, n)` | Even-odd polygon from `n` points (`pts` = x0, y0, x1, y1, ...). |
+| `line(c, x0, y0, x1, y1, s)` / `stamp(c, x, y, s)` | Bresenham line stamped with a round pen of size `s` (1 = one pixel, 2 = 2×2, larger = a disc). |
+| `PolyPen pen(c, s); pen.to(x, y) ...; pen.end() / pen.close()` | A polyline with the same pen. Feed it from the point generators below. |
+| `quadPoints`, `cubicPoints`, `arcPoints`, `wavePoints`, `spiralPoints` | Emit points of a quadratic / cubic Bézier, an arc (degrees), a sine wave, or a spiral to a callable `out(x, y)`; segment count from `curveSegments(length)` (4–32). |
+| `text(c, x, y, size, s, len, turn, align)` | The classic 5×7 font at integer scale `size`, rotated by `turn` (0/90/180/270) about the top-left corner, aligned `LEFT` / `CENTER` / `RIGHT`. |
+
+**Painting**
+
+| Type / function | Description |
+|---|---|
+| `struct Pen { texture, level, param, mode, seed }` | `level` 0 (paper) .. 16 (solid ink); `param` = texture scale 2..64; `seed` keys the random textures. |
+| `enum Texture` | `FLAT` (4×4 Bayer, `PackMono`'s own dither), `NOISE` (white noise), `GATED` (noise only inside smooth random patches), `CLOUD` (bilinear value noise), `HATCH`, `LINES`, `VLINES`, `CROSS`, `DOTS` (halftone). |
+| `enum Mode` | `COVER` (ink and paper: occludes what is under it), `GLAZE` (adds ink only), `ERASE` (makes paper), `INVERT` (flips). |
+| `bool inked(pen, xl, yl)` | The per-pixel texture rule, in layer-local coordinates. |
+| `paint(dst, cov, pen, mx, my, cx0, cy0, cx1, cy1, mask, maskOutside)` | Apply a coverage to `dst`. Only pixels inside the clip rectangle `[cx0, cx1) × [cy0, cy1)`, and inside `mask` (or outside it, with `maskOutside`), are touched. Textures read `(x - mx, y - my)`, so a moved layer carries its texture along. |
+| `blit(canvas, x, y, bits, inkColour, paperColour)` | Draw an `InkBits` onto any canvas with `drawFastHLine` (e.g. a `PackCanvas`), run by run. |
+
+```cpp
+static uint8_t artBuf[240 / 8 * 128], covBuf[240 / 8 * 128];
+packink::InkBits art(240, 128, artBuf);
+packink::InkCoverage cov(240, 128, covBuf);
+packink::Pen pen;
+art.clear();
+cov.reset(); packink::fillRect(cov, 0, 0, 240, 128);
+pen.texture = packink::CLOUD; pen.param = 24; pen.level = 7;
+packink::paint(art, cov, pen, 0, 0);                 // a clouded sky
+cov.reset(); packink::fillEllipse(cov, 180, 40, 22, 22);
+pen.mode = packink::ERASE;
+packink::paint(art, cov, pen, 0, 0);                 // a moon cut out of it
+packink::blit(canvas, 80, 86, art, 1, 0);            // onto a PackCanvas: index 1 = ink
+```
+
+**Memory:** two bitmaps of `(w+7)/8 × h` bytes (3 840 each at 240×128) for the picture and the
+coverage, plus one per mask. Nothing else. Complete sketch: `examples/InkArt_Basics`.
 
 ---
 
