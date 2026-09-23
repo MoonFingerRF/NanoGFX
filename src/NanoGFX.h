@@ -10,11 +10,20 @@
 //                  8-bit LUT, or 32-bit LUT).
 //    PackFlush   — dirty-band frame flushing: keep an on-glass copy of each
 //                  row's encoded stream and push only the rows that changed.
+//    PackMono    — export to a 1-bit panel: per-index ink levels become a 4x4
+//                  ordered dither; diffRows() finds an e-paper partial window.
+//
+//  Builds with Adafruit_GFX (Arduino) or without it (ESP-IDF, ESPHome, host):
+//  NanoGFXBase.h stands in when Adafruit_GFX.h is absent or NANOGFX_STANDALONE
+//  is defined. GFXfont proportional fonts work in both (tools/ttf2gfxfont.py).
 //
 //  Panel drivers (include the ones you use; ESP32-only):
 //    RM690B0.h   — QSPI AMOLED driver with split-polling writes
 //                  (ramWriteStart/ramWriteEnd let the CPU prepare chunk n+1
 //                  while chunk n rides the SPI DMA).
+//    ST7789.h    — 4-wire SPI TFTs, same split-polling shape.
+//    UC8179.h    — 800x480 e-paper (Waveshare 7.5" V2, reTerminal E1001):
+//                  non-blocking full + windowed partial refresh over any bus.
 //
 //  Battle-tested in NanoPFD (an ESP32-S3 glass cockpit): 450x600 AMOLED at
 //  46-48 fps with WiFi AP + two BLE/WiFi receivers live on the same chip.
@@ -24,3 +33,4 @@
 #include "PackRLE.h"
 #include "PackCanvas.h"
 #include "PackFlush.h"
+#include "PackMono.h"

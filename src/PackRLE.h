@@ -441,6 +441,43 @@ static inline bool prle_decode_p3(const uint8_t *enc, size_t nb, int w, uint8_t 
   return true;
 }
 
+// ---- PackRLE images: a small container for a whole picture -------------------
+// A picture is its rows' streams back to back, each prefixed with its byte length as a
+// little-endian uint16:   [len0 lo][len0 hi][stream0 ...][len1 lo][len1 hi][stream1 ...]
+// This is what travels when a picture is sent to a device (an album cover, an icon): rows
+// stay independently decodable, and the size bound is the codec's own plus 2 bytes a row.
+// Width and height travel beside it (the container does not repeat them).
+
+// Encode an 8-bit indexed picture (one palette index per byte, 0..14) into `out`, which
+// must hold h * (2 + PRLE_STRIDE(w)) bytes. Returns the bytes written.
+static inline size_t prle_image_encode_idx8(const uint8_t *idx, int w, int h, uint8_t *out) {
+  size_t n = 0;
+  for (int y = 0; y < h; y++) {
+    size_t len = prle_encode_idx8(idx + (size_t)y * w, w, out + n + 2);
+    out[n] = (uint8_t)(len & 0xFF);
+    out[n + 1] = (uint8_t)(len >> 8);
+    n += 2 + len;
+  }
+  return n;
+}
+
+// Decode a PackRLE image into packed 4-bit rows (stride PRLE_STRIDE(w), even x = high
+// nibble) -- the layout PackCanvas::drawIndexedBitmap draws. False on a truncated or
+// malformed container; rows decoded before the fault are left in place.
+static inline bool prle_image_decode_flat(const uint8_t *enc, size_t nb, int w, int h, uint8_t *flat) {
+  size_t k = 0;
+  const size_t stride = PRLE_STRIDE(w);
+  for (int y = 0; y < h; y++) {
+    if (k + 2 > nb) return false;
+    size_t len = (size_t)enc[k] | ((size_t)enc[k + 1] << 8);
+    k += 2;
+    if (len > nb - k || len > stride) return false;
+    if (!prle_decode_flat(enc + k, len, w, flat + (size_t)y * stride)) return false;
+    k += len;
+  }
+  return true;
+}
+
 #ifdef __XTENSA__
 #pragma GCC pop_options
 #endif
