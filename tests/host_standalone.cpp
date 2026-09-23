@@ -111,13 +111,18 @@ struct SimBus {
   uint32_t t = 0, busyUntil = 0;
   std::vector<uint8_t> cmds;
   size_t dataBytes = 0;
+  std::vector<std::pair<uint8_t, std::vector<uint8_t>>> log;   // every command with its data
   void command(uint8_t c) {
+    log.push_back({c, {}});
     cmds.push_back(c);
     if (c == 0x04) busyUntil = t + 50;
     if (c == 0x12) busyUntil = t + 900;
     if (c == 0x02) busyUntil = t + 20;
   }
-  void data(const uint8_t *, size_t n) { dataBytes += n; }
+  void data(const uint8_t *p, size_t n) {
+    dataBytes += n;
+    if (!log.empty() && log.back().second.size() < 256) log.back().second.insert(log.back().second.end(), p, p + (n > 256 ? 256 : n));
+  }
   bool busy() { return (int32_t)(busyUntil - t) > 0; }
   void reset(bool) {}
   void delayMs(uint32_t ms) { t += ms; }
@@ -227,11 +232,64 @@ static void test_ghost() {
   CHECK(g.budget() == 360);
 }
 
+// The fast register-LUT path: the datasheet's table lengths, the research's safety rules S1-S4.
+static void test_fast() {
+  SimBus bus;
+  UC8179<SimBus> epd(bus);
+  epd.begin();
+  static uint8_t a[48000], b[48000];
+  bus.log.clear();
+  CHECK(!epd.startFast(b, a, 0, 128, 2, 32, 0) && !epd.startFast(b, a, 0, 128, 2, 32, 61));   // bounds
+  CHECK(epd.startFast(b, a, 40, 168, 2, 32, 25));
+  auto find = [&](uint8_t c) -> const std::vector<uint8_t> * {
+    for (auto &e : bus.log) if (e.first == c) return &e.second;
+    return nullptr;
+  };
+  auto psr = find(0x00), vdcs = find(0x82), cdi = find(0x50);
+  CHECK(psr && psr->size() == 1 && (*psr)[0] == 0x3F);
+  CHECK(vdcs && vdcs->size() == 1 && (*vdcs)[0] == 0x26);                     // S3
+  CHECK(cdi && cdi->size() == 2 && (*cdi)[0] == 0x39);                        // border -> LUTBD
+  const uint8_t lens[6] = {60, 42, 60, 60, 60, 42};
+  for (int k = 0; k < 6; k++) { auto t = find(0x20 + k); CHECK(t && t->size() == lens[k]); }
+  auto zero = [](const std::vector<uint8_t> *t) { for (uint8_t v : *t) if (v) return false; return true; };
+  CHECK(zero(find(0x21)) && zero(find(0x24)) && zero(find(0x25)));             // S1: WW, KK, BD
+  auto kw = find(0x22), wk = find(0x23), vc = find(0x20);
+  CHECK((*kw)[0] == 0x80 && (*wk)[0] == 0x40);                                 // VDL / VDH
+  for (int i = 1; i < 60; i++) CHECK((*kw)[i] == (*wk)[i]);                    // S2: mirror timing
+  CHECK((*kw)[1] == 25 && (*kw)[5] == 1 && (*vc)[0] == 0x00 && (*vc)[1] == 25); // VCOM at VCOM_DC
+  for (auto &e : bus.log) if (e.first >= 0x20 && e.first <= 0x25)
+    for (size_t i = 0; i < e.second.size(); i += 6) for (int ph = 0; ph < 4; ph++)
+      CHECK(((e.second[i] >> (6 - 2 * ph)) & 3) != 3);                         // never VDHR / float
+  int guard = 0;
+  while (!epd.isIdle() && guard++ < 20000) { bus.t += 5; epd.poll(); }
+  CHECK(epd.isIdle() && epd.fastActive());
+  // S4: the next OTP refresh starts from a hardware reset: PSR 0x1F before any refresh command
+  bus.log.clear();
+  CHECK(epd.startPartial(b, a, 0, 8));
+  CHECK(!epd.fastActive());
+  bool sawPsr = false, psrOtp = false;
+  for (auto &e : bus.log) {
+    if (e.first == 0x00 && !sawPsr) { sawPsr = true; psrOtp = e.second.size() == 1 && e.second[0] == 0x1F; }
+    CHECK(!(e.first >= 0x20 && e.first <= 0x25));                             // no LUT on the OTP path
+  }
+  CHECK(sawPsr && psrOtp);
+  bool powerOn = false;
+  for (auto &e : bus.log) if (e.first == 0x04) powerOn = true;
+  CHECK(powerOn);                                                              // the reset took the rails down
+  while (!epd.isIdle() && guard++ < 40000) { bus.t += 5; epd.poll(); }
+  epd.startFast(b, a, 40, 168, 2, 32, 25);
+  while (!epd.isIdle() && guard++ < 60000) { bus.t += 5; epd.poll(); }
+  bus.log.clear();
+  CHECK(epd.startFull(a) && !epd.fastActive());
+  CHECK(!bus.log.empty() && bus.log[0].first == 0x01);                         // begin() came first
+}
+
 int main(int argc, char **argv) {
   test_canvas_and_text();
   test_mono_export();
   test_prle_image(argc > 3 ? argv[1] : nullptr, argc > 3 ? atoi(argv[2]) : 37, argc > 3 ? atoi(argv[3]) : 11);
   test_uc8179();
+  test_fast();
   test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;

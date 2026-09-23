@@ -94,6 +94,8 @@ public:
     waitIdle(1000);
     step_ = Step::IDLE;
     faulted_ = false;
+    powered_ = false;                      // the reset took the rails down
+    regLut_ = false;                       // and every register is the vendor's again
   }
 
   bool isIdle() const { return step_ == Step::IDLE; }
@@ -121,6 +123,7 @@ public:
   // Queue a full refresh of `frame` (W*H/8 bytes). Returns false if a refresh is running.
   bool startFull(const uint8_t *frame) {
     if (step_ != Step::IDLE) return false;
+    if (regLut_) begin();                  // S4: an OTP refresh starts from the vendor's registers
     full_ = true; clean_ = false; count_ = true; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
     xb0_ = 0; xb1_ = ROW;
     cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
@@ -148,6 +151,7 @@ public:
     if (xb0 < 0) xb0 = 0;
     if (xb1 > ROW) xb1 = ROW;
     if (y0 >= y1 || xb0 >= xb1) return false;
+    if (regLut_) begin();                  // S4: an OTP refresh starts from the vendor's registers
     full_ = false; clean_ = clean; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     xb0_ = xb0; xb1_ = xb1;
     cmd(0x50, {CDI_PARTIAL, 0x07});        // data polarity 1 = ink, new->old copy, border driven
@@ -160,6 +164,58 @@ public:
     powerOn();
     return true;
   }
+
+  // FAST: a 1-bit waveform from register LUTs on a window (research E2+, owner-approved
+  // 2026-09-23). Verified against the UC8179c datasheet (rev C0.6): PSR 0x00 bit 5 = REG (LUT from
+  // register), bit 4 = KW mode; LUTC 0x20, LUTKW 0x22, LUTWK 0x23, LUTKK 0x24 are 60 bytes (10 groups
+  // of 6: level byte, 4 frame counts, repeat), LUTWW 0x21 and LUTBD 0x25 42 bytes (7 groups); KW
+  // mode uses 7 groups. Source levels 00 GND, 01 VDH, 10 VDL, 11 VDHR (never used). VDCS 0x82 0x26
+  // = -2.00 V. With DDX=01, {NEW,OLD} = 01 -> LUTWK, 10 -> LUTKW, 00 -> LUTKK, 11 -> LUTWW; CDI
+  // BDV=11 sends the border to LUTBD.
+  // Safety (research S1-S4): unchanged pixels (WW, KK) and the border (BD) are never driven; KW and
+  // WK are mirror images (one phase of `frames` at VDL and VDH); VCOM_DC is set explicitly; and the
+  // next OTP refresh of any kind begins with a hardware reset + begin() (vendor registers).
+  static constexpr uint8_t FAST_VCOM_DC = 0x26;           // -2.00 V
+  static constexpr uint8_t FAST_CDI = 0x39;               // BDZ=0 BDV=11 (LUTBD) N2OCP=1 DDX=01
+  static constexpr uint8_t LVL_TO_WHITE = 0x80;           // phase 0 = 10b: VDL (K->W)
+  static constexpr uint8_t LVL_TO_BLACK = 0x40;           // phase 0 = 01b: VDH (W->K)
+  static_assert((LVL_TO_WHITE & 0xC0) != 0xC0 && (LVL_TO_BLACK & 0xC0) != 0xC0, "never VDHR (11b)");
+  static_assert((LVL_TO_WHITE >> 6) + (LVL_TO_BLACK >> 6) == 3 && LVL_TO_WHITE != LVL_TO_BLACK,
+                "KW and WK must be mirror images: one VDL, one VDH");
+  static constexpr uint8_t FAST_MAX_FRAMES = 60;
+
+  // A table: group 0 = one phase of `frames` at `level`, repeated once; every other group zero.
+  static void fastLut(uint8_t *out, size_t len, uint8_t level, uint8_t frames) {
+    memset(out, 0, len);
+    if (!frames) return;
+    out[0] = level; out[1] = frames; out[5] = 1;
+  }
+
+  bool startFast(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1, uint8_t frames) {
+    if (step_ != Step::IDLE || !prev || frames == 0 || frames > FAST_MAX_FRAMES) return false;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (xb0 < 0) xb0 = 0;
+    if (xb1 > ROW) xb1 = ROW;
+    if (y0 >= y1 || xb0 >= xb1) return false;
+    full_ = false; clean_ = false; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
+    xb0_ = xb0; xb1_ = xb1;
+    uint8_t t60[60], t42[42];
+    cmd(0x00, {0x3F});                     // PSR: LUT from register, KW mode (rest as vendor 0x1F)
+    cmd(0x82, {FAST_VCOM_DC});             // S3: VCOM_DC explicit
+    cmd(0x50, {FAST_CDI, 0x07});           // border -> LUTBD (all zero: not driven)
+    cmd(0xE0, {0x00});                     // no forced temperature
+    fastLut(t60, 60, 0x00, frames); cmdData(0x20, t60, 60);    // VCOM at VCOM_DC for the phase
+    fastLut(t42, 42, 0x00, 0);      cmdData(0x21, t42, 42);    // WW: never driven (S1)
+    fastLut(t60, 60, LVL_TO_WHITE, frames); cmdData(0x22, t60, 60);   // KW: VDL
+    fastLut(t60, 60, LVL_TO_BLACK, frames); cmdData(0x23, t60, 60);   // WK: VDH (mirror, S2)
+    fastLut(t60, 60, 0x00, 0);      cmdData(0x24, t60, 60);    // KK: never driven (S1)
+    fastLut(t42, 42, 0x00, 0);      cmdData(0x25, t42, 42);    // BD: never driven (S1)
+    regLut_ = true;
+    powerOn();
+    return true;
+  }
+  bool fastActive() const { return regLut_; }
 
   // Advance the running refresh by at most one step. Cheap when idle or still busy.
   void poll() {
@@ -225,6 +281,7 @@ private:
   int xb0_ = 0, xb1_ = ROW;
   Timing timing_{0, 0, 0, 0};
   uint8_t partialTemp_ = 0x6E;
+  bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
   uint32_t notBefore_ = 0, stepStart_ = 0, lastStatus_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0;
@@ -237,6 +294,10 @@ private:
       bus_.delayMs(5);
     }
     return true;
+  }
+  void cmdData(uint8_t c, const uint8_t *d, size_t n) {
+    bus_.command(c);
+    if (n) bus_.data(d, n);
   }
   void cmd(uint8_t c, std::initializer_list<uint8_t> d) {
     bus_.command(c);
