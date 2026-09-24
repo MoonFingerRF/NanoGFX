@@ -65,6 +65,39 @@ static void test_mono_export() {
   auto inv = mem(PackMono::rowBytes(W) * H);
   m.exportRows(c, inv.data(), 0, H, false);
   CHECK(inv[0] == 0x00 && inv[2] == 0xFF);
+  // exportRect: the rectangle as exportRows makes it, every other byte untouched
+  for (int inkBit = 0; inkBit < 2; inkBit++) {
+    auto whole = mem(PackMono::rowBytes(W) * H);
+    m.exportRows(c, whole.data(), 0, H, inkBit != 0);
+    auto rect = mem(PackMono::rowBytes(W) * H);
+    for (auto &b : rect) b = 0x5A;
+    m.exportRect(c, rect.data(), 1, 3, 2, 7, inkBit != 0);
+    bool ok = true;
+    for (int y = 0; y < H; y++)
+      for (int b = 0; b < 5; b++) {
+        const bool in = b >= 1 && b < 3 && y >= 2 && y < 7;
+        ok &= in ? rect[y * 5 + b] == whole[y * 5 + b] : rect[y * 5 + b] == 0x5A;
+      }
+    CHECK(ok);
+    m.exportRect(c, rect.data(), 0, 99, 0, 99, inkBit != 0);   // clamped: the whole frame
+    CHECK(rect == whole);
+  }
+  {   // a width that is not a multiple of 8: the tail byte
+    PackCanvas t(36, 5, false);
+    t.packed4 = true;
+    auto tb = mem(PackCanvas::bufBytes(36, 5, true));
+    t.useBuffer(tb.data());
+    t.fillScreen(0);
+    t.fillRect(30, 0, 6, 5, 3);
+    t.fillRect(20, 1, 9, 2, 1);
+    auto whole = mem(PackMono::rowBytes(36) * 5), rect = mem(PackMono::rowBytes(36) * 5);
+    m.exportRows(t, whole.data(), 0, 5);
+    m.exportRect(t, rect.data(), 2, 5, 0, 5);
+    bool ok = true;
+    for (int y = 0; y < 5; y++)
+      for (int b = 0; b < 5; b++) ok &= b >= 2 ? rect[y * 5 + b] == whole[y * 5 + b] : rect[y * 5 + b] == 0;
+    CHECK(ok);
+  }
   int y0, y1;
   CHECK(!PackMono::diffRows(out.data(), out.data(), W, H, &y0, &y1));
   auto other = out;
