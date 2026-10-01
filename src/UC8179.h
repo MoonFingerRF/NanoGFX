@@ -361,14 +361,23 @@ public:
            lutAllZeroLevel(bd42, 42);
   }
   bool startNeutral(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1, uint8_t frames) {
+    uint8_t c60[60], ww42[42], kw60[60], wk60[60], kk60[60], bd42[42];
+    if (!neutralTables(frames, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    neutralCount_++;
+    return true;
+  }
+private:
+  // The shared register-partial sequence of NEUTRAL and PAIR (tables already checked by them).
+  bool startRegister(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1,
+                     const uint8_t *c60, const uint8_t *ww42, const uint8_t *kw60, const uint8_t *wk60,
+                     const uint8_t *kk60, const uint8_t *bd42) {
     if (step_ != Step::IDLE || !prev || !frame) return false;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
     if (xb0 < 0) xb0 = 0;
     if (xb1 > ROW) xb1 = ROW;
     if (y0 >= y1 || xb0 >= xb1) return false;
-    uint8_t c60[60], ww42[42], kw60[60], wk60[60], kk60[60], bd42[42];
-    if (!neutralTables(frames, c60, ww42, kw60, wk60, kk60, bd42)) return false;
     full_ = false; clean_ = false; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     xb0_ = xb0; xb1_ = xb1;
     cmd(0x00, {0x3F});                     // PSR: LUT from register, KW mode (as FAST)
@@ -383,10 +392,64 @@ public:
     cmdData(0x25, bd42, 42);
     regLut_ = true;
     neutral_ = true;
-    neutralCount_++;
+    pair_ = false;
     powerOn();
     return true;
   }
+public:
+  // PAIR partial (2026-10-01, after the 0.3.2 glass result; BENCH-SELECTED, never a default).
+  // NEUTRAL's per-transition balance cancelled its own drive: changed pixels never reached full
+  // black/white. PAIR keeps NEUTRAL's zero-field rules for everything that does not change (N1),
+  // its constant VCOM (N3), bounds (N4), scan (N5) and exit fence (N6), but drives each transition
+  // in ONE direction, like a normal partial:
+  //   P1  K->W = VDL x n (LVL_TO_WHITE), W->K = VDH x n (LVL_TO_BLACK) -- the polarities measured on
+  //       this glass (E2, 2026-09-23); optionally preceded by a symmetric pre-shake of s frames at
+  //       the opposite level (K->W: VDH s then VDL n; W->K: VDL s then VDH n), s < n, s <= 10.
+  //   P2  DC balance is over the PAIR: net(K->W) + net(W->K) == 0, net(K->W) < 0 < net(W->K).
+  //       A pixel's transitions strictly alternate (it can only go K->W when it is black), so its
+  //       running net stays within one transition, (n - s) frames at 15 V -- as long as every
+  //       change of that pixel is a PAIR transition (the firmware keeps full refreshes from
+  //       carrying picture changes while PAIR is on, see nostalgia_panel 0.3.3).
+  // pairTables() refuses any table set whose pair sum is not 0 or whose sides do not drive the
+  // right way; startPair sends nothing then.
+  static constexpr uint8_t PAIR_MAX_SHAKE = 10;
+  // group 0 at `first` for f1 frames then group 1 at `second` for f2 frames; f1 = 0 puts `second`
+  // in group 0 (a zero group would be the end condition).
+  static void twoPhaseLut(uint8_t *out, size_t len, uint8_t first, uint8_t f1, uint8_t second, uint8_t f2) {
+    memset(out, 0, len);
+    size_t g = 0;
+    if (f1) { out[0] = first; out[1] = f1; out[5] = 1; g = 6; }
+    out[g] = second; out[g + 1] = f2; out[g + 5] = 1;
+  }
+  static bool pairBalanced(const uint8_t *kw60, const uint8_t *wk60) {
+    const int32_t a = lutNetFrames(kw60, 60), b = lutNetFrames(wk60, 60);
+    return a != INT32_MIN && b != INT32_MIN && a < 0 && b > 0 && a + b == 0;
+  }
+  static bool pairTables(uint8_t frames, uint8_t shake, uint8_t *c60, uint8_t *ww42, uint8_t *kw60, uint8_t *wk60,
+                         uint8_t *kk60, uint8_t *bd42) {
+    if (frames < NEUTRAL_MIN_FRAMES || frames > NEUTRAL_MAX_FRAMES || shake > PAIR_MAX_SHAKE || shake >= frames)
+      return false;
+    twoPhaseLut(c60, 60, 0x00, shake, 0x00, frames);                        // N3: VCOM_DC throughout
+    twoPhaseLut(ww42, 42, 0x00, shake, 0x00, frames);                       // N1: W->W at GND
+    twoPhaseLut(kw60, 60, LVL_TO_BLACK, shake, LVL_TO_WHITE, frames);       // P1: K->W
+    twoPhaseLut(wk60, 60, LVL_TO_WHITE, shake, LVL_TO_BLACK, frames);       // P1: W->K
+    twoPhaseLut(kk60, 60, 0x00, shake, 0x00, frames);                       // N1: K->K at GND
+    twoPhaseLut(bd42, 42, 0x00, shake, 0x00, frames);                       // N1: border at VCOM
+    return pairBalanced(kw60, wk60) && lutAllZeroLevel(c60, 60) && lutAllZeroLevel(ww42, 42) &&
+           lutAllZeroLevel(kk60, 60) && lutAllZeroLevel(bd42, 42);
+  }
+  bool startPair(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1, uint8_t frames,
+                 uint8_t shake = 0) {
+    uint8_t c60[60], ww42[42], kw60[60], wk60[60], kk60[60], bd42[42];
+    if (!pairTables(frames, shake, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    pair_ = true;
+    pairCount_++;
+    return true;
+  }
+  bool pairActive() const { return regLut_ && neutral_ && pair_; }
+  uint32_t pairCount() const { return pairCount_; }
+
   // VDCS for the neutral path only: clamped to 0x00..FAST_VCOM_MIN (-0.10 .. -0.60 V), so it can
   // never be more negative than production's FAST value. Default FAST_VCOM_MIN. Takes effect at the
   // next startNeutral (no command is sent here).
@@ -502,7 +565,9 @@ private:
   bool offBeforeReset_ = true;  // leaveFast(): power off before the S4 reset
   bool scanOutside_ = true;  // factory PT_SCAN only; default unchanged
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
-  bool neutral_ = false;      // ... and they are the NEUTRAL set (scan follows scanOutside_)
+  bool neutral_ = false;      // ... and they are the NEUTRAL or PAIR set (scan follows scanOutside_)
+  bool pair_ = false;         // ... the PAIR set
+  uint32_t pairCount_ = 0;
   uint8_t neutralVcom_ = FAST_VCOM_MIN;
   uint32_t neutralCount_ = 0;
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;

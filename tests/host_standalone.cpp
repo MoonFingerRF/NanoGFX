@@ -513,6 +513,119 @@ static void test_neutral() {
   CHECK(epd.faulted());
 }
 
+// PAIR partial (2026-10-01): one-direction drive per transition, balanced over the K->W / W->K pair;
+// zero-field tables as NEUTRAL; exact bytes; bounded per-pixel running DC over any history.
+static void test_pair() {
+  typedef UC8179<SimBus> E;
+  for (int n = 0; n <= 40; n++)
+    for (int sh = 0; sh <= 12; sh++) {
+      uint8_t c[60], ww[42], kw[60], wk[60], kk[60], bd[42];
+      const bool ok = E::pairTables((uint8_t) n, (uint8_t) sh, c, ww, kw, wk, kk, bd);
+      CHECK(ok == (n >= E::NEUTRAL_MIN_FRAMES && n <= E::NEUTRAL_MAX_FRAMES && sh <= E::PAIR_MAX_SHAKE && sh < n));
+      if (!ok) continue;
+      CHECK(E::pairBalanced(kw, wk));
+      CHECK(E::lutNetFrames(kw, 60) == sh - n && E::lutNetFrames(wk, 60) == n - sh);   // one direction each
+      CHECK(E::lutAllZeroLevel(c, 60) && E::lutAllZeroLevel(ww, 42) && E::lutAllZeroLevel(kk, 60) &&
+            E::lutAllZeroLevel(bd, 42));
+      // the drive phase is the last group that runs: K->W ends on VDL (white), W->K on VDH (black)
+      const int g = sh ? 6 : 0;
+      CHECK(kw[g] == E::LVL_TO_WHITE && wk[g] == E::LVL_TO_BLACK && kw[g + 1] == n && wk[g + 1] == n);
+      if (sh) CHECK(kw[0] == E::LVL_TO_BLACK && wk[0] == E::LVL_TO_WHITE && kw[1] == sh && wk[1] == sh);
+      const uint8_t *all[6] = {c, ww, kw, wk, kk, bd};
+      const size_t len[6] = {60, 42, 60, 60, 60, 42};
+      for (int t = 0; t < 6; t++) {                       // identical timing in every table
+        CHECK(all[t][g + 1] == n && all[t][g + 5] == 1);
+        if (sh) CHECK(all[t][1] == sh && all[t][5] == 1);
+        for (size_t i = (size_t) g + 6; i < len[t]; i++) CHECK(all[t][i] == 0);
+        for (size_t q = 0; q < len[t]; q += 6) CHECK((all[t][q] & 0xC0) != 0xC0);
+      }
+      // per-pixel running DC over a long random history: transitions alternate, so the running
+      // sum never leaves {0, n - sh} (started white) -- one transition at most
+      uint32_t r = 12345u + (uint32_t) (n * 31 + sh);
+      bool black = false;
+      int32_t sum = 0;
+      for (int step = 0; step < 4000; step++) {
+        r = r * 1664525u + 1013904223u;
+        const bool want = (r >> 16) & 1;
+        if (want != black) { sum += black ? E::lutNetFrames(kw, 60) : E::lutNetFrames(wk, 60); black = want; }
+        CHECK(sum == (black ? n - sh : 0));
+      }
+    }
+  // pairBalanced refuses: an uneven pair, both the same way, a backwards pair, VDHR
+  {
+    uint8_t kw[60], wk[60];
+    E::twoPhaseLut(kw, 60, 0, 0, E::LVL_TO_WHITE, 10);
+    E::twoPhaseLut(wk, 60, 0, 0, E::LVL_TO_BLACK, 11);
+    CHECK(!E::pairBalanced(kw, wk));
+    E::twoPhaseLut(wk, 60, 0, 0, E::LVL_TO_WHITE, 10);
+    CHECK(!E::pairBalanced(kw, wk));
+    E::twoPhaseLut(wk, 60, 0, 0, E::LVL_TO_BLACK, 10);
+    CHECK(E::pairBalanced(kw, wk) && !E::pairBalanced(wk, kw));
+    wk[0] = 0xC0;
+    CHECK(!E::pairBalanced(kw, wk));
+  }
+  SimBus bus;
+  E epd(bus);
+  epd.begin();
+  static uint8_t prev[48000], next[48000];
+  for (size_t i = 0; i < sizeof next; i++) next[i] = (uint8_t) (i * 7);
+  for (size_t i = 0; i < sizeof prev; i++) prev[i] = (uint8_t) (i * 13);
+  auto complete = [&]() {
+    int guard = 0;
+    while (!epd.isIdle() && guard++ < 5000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.isIdle() && !epd.faulted());
+  };
+  static const std::vector<uint8_t> none(9, 0xEE);
+  auto find = [&](uint8_t c) -> const std::vector<uint8_t> * {
+    for (auto &e : bus.log) if (e.first == c) return &e.second;
+    return &none;
+  };
+  bus.log.clear();
+  CHECK(!epd.startPair(next, prev, 40, 60, 3, 11, 3));
+  CHECK(!epd.startPair(next, prev, 40, 60, 3, 11, 31));
+  CHECK(!epd.startPair(next, prev, 40, 60, 3, 11, 10, 10));
+  CHECK(!epd.startPair(next, prev, 40, 60, 3, 11, 20, 11));
+  CHECK(!epd.startPair(next, nullptr, 40, 60, 3, 11, 10));
+  CHECK(bus.log.empty());
+  epd.stayPowered(false);
+  CHECK(epd.startPair(next, prev, 40, 60, 3, 11, 20, 2));
+  complete();
+  CHECK(epd.pairActive() && epd.neutralActive() && epd.pairCount() == 1 && epd.neutralCount() == 0);
+  std::vector<uint8_t> order;
+  for (auto &e : bus.log) if (e.first != 0x71) order.push_back(e.first);
+  CHECK(order == (std::vector<uint8_t>{0x00, 0x82, 0x50, 0xE0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x04,
+                                       0x91, 0x90, 0x10, 0x13, 0x12, 0x92, 0x02}));
+  CHECK(*find(0x82) == std::vector<uint8_t>{0x0A} && *find(0x00) == std::vector<uint8_t>{0x3F});
+  CHECK(*find(0x50) == (std::vector<uint8_t>{0x39, 0x07}));
+  {
+    uint8_t c[60], ww[42], kw[60], wk[60], kk[60], bd[42];
+    CHECK(E::pairTables(20, 2, c, ww, kw, wk, kk, bd));
+    CHECK(*find(0x20) == std::vector<uint8_t>(c, c + 60) && *find(0x21) == std::vector<uint8_t>(ww, ww + 42));
+    CHECK(*find(0x22) == std::vector<uint8_t>(kw, kw + 60) && *find(0x23) == std::vector<uint8_t>(wk, wk + 60));
+    CHECK(*find(0x24) == std::vector<uint8_t>(kk, kk + 60) && *find(0x25) == std::vector<uint8_t>(bd, bd + 42));
+  }
+  CHECK((*find(0x90))[8] == 0x01);
+  for (auto &e : bus.log) CHECK(e.first != 0xE5 && e.first != 0x2A && e.first != 0x01 && e.first != 0x06);
+  epd.partialScanOutside(false);
+  bus.log.clear();
+  CHECK(epd.startPair(prev, next, 40, 60, 3, 11, 20)); complete();
+  CHECK((*find(0x90))[8] == 0x00);
+  bus.log.clear();
+  CHECK(epd.startNeutral(next, prev, 40, 60, 3, 11, 10)); complete();
+  CHECK(!epd.pairActive() && epd.neutralActive() && (*find(0x90))[8] == 0x00);
+  bus.log.clear();
+  CHECK(epd.startFast(prev, next, 40, 60, 3, 11, 10)); complete();
+  CHECK(!epd.pairActive() && (*find(0x90))[8] == 0x01);
+  epd.partialScanOutside(true);
+  epd.stayPowered(true);                              // rails up: the exit must power off first
+  bus.log.clear();
+  CHECK(epd.startPair(next, prev, 40, 60, 3, 11, 20)); complete();
+  CHECK(epd.powered());
+  bus.log.clear();
+  CHECK(epd.startFull(prev)); complete();
+  CHECK(!epd.pairActive() && !epd.fastActive() && bus.log[0].first == 0x02);         // S4 exit fence
+}
+
 static void test_ghost() {
   const int W = 100, H = 24;                     // row bytes, rows (3 cell rows of 8)
   std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
@@ -669,6 +782,7 @@ int main(int argc, char **argv) {
   test_idle_power();
   test_factory_power_bytes();
   test_neutral();
+  test_pair();
   test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;
