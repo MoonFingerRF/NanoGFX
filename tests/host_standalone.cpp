@@ -372,6 +372,147 @@ static void test_old_sync() {
   clear(); CHECK(!epd.syncOld(glass.data()) && bus.cmds.empty());
 }
 
+// NEUTRAL partial (2026-10-01): exact bytes, DC balance per transition, zero-field tables, scan,
+// VCOM clamp, bounds, and the S4 exit back to the vendor registers.
+static void test_neutral() {
+  typedef UC8179<SimBus> E;
+  // the tables themselves
+  for (int n = 0; n <= 40; n++) {
+    uint8_t c[60], ww[42], kw[60], wk[60], kk[60], bd[42];
+    const bool ok = E::neutralTables((uint8_t) n, c, ww, kw, wk, kk, bd);
+    CHECK(ok == (n >= E::NEUTRAL_MIN_FRAMES && n <= E::NEUTRAL_MAX_FRAMES));
+    if (!ok) continue;
+    CHECK(E::lutNetFrames(kw, 60) == 0 && E::lutNetFrames(wk, 60) == 0);        // N2 per transition
+    CHECK(E::lutAllZeroLevel(c, 60) && E::lutAllZeroLevel(ww, 42) && E::lutAllZeroLevel(kk, 60) &&
+          E::lutAllZeroLevel(bd, 42));                                           // N1, N3
+    // K->W ends at VDL (to white) after a VDH pre-phase; W->K is its mirror (N2)
+    CHECK(kw[0] == 0x40 && kw[6] == 0x80 && wk[0] == 0x80 && wk[6] == 0x40);
+    // every table runs the same two groups of n frames, once, then the end condition (all zero)
+    const uint8_t *all[6] = {c, ww, kw, wk, kk, bd};
+    const size_t len[6] = {60, 42, 60, 60, 60, 42};
+    for (int t = 0; t < 6; t++) {
+      CHECK(all[t][1] == n && all[t][7] == n && all[t][5] == 1 && all[t][11] == 1);
+      for (int i = 2; i <= 4; i++) CHECK(all[t][i] == 0 && all[t][6 + i] == 0);
+      for (size_t i = 12; i < len[t]; i++) CHECK(all[t][i] == 0);
+      for (size_t g = 0; g < len[t]; g += 6) CHECK((all[t][g] & 0xC0) != 0xC0);   // never 11b
+    }
+    // total drive time per transition: 2n frames, |V| = 15 V, never longer than 60 frames
+    CHECK(2 * n <= 60);
+  }
+  // the arithmetic checker itself catches an unbalanced or VDHR table
+  {
+    uint8_t t[60];
+    E::fastLut(t, 60, E::LVL_TO_WHITE, 10);
+    CHECK(E::lutNetFrames(t, 60) == -10);          // the FAST single phase: balanced only as a pair
+    t[0] = 0xC0;
+    CHECK(E::lutNetFrames(t, 60) == INT32_MIN);
+    E::fastLut(t, 60, 0x00, 10);
+    CHECK(E::lutAllZeroLevel(t, 60));
+    t[0] = 0x40;
+    CHECK(!E::lutAllZeroLevel(t, 60));
+  }
+  SimBus bus;
+  E epd(bus);
+  epd.begin();
+  static uint8_t prev[48000], next[48000];
+  for (size_t i = 0; i < sizeof next; i++) next[i] = (uint8_t) (i * 7);
+  for (size_t i = 0; i < sizeof prev; i++) prev[i] = (uint8_t) (i * 13);
+  auto complete = [&]() {
+    int guard = 0;
+    while (!epd.isIdle() && guard++ < 5000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.isIdle() && !epd.faulted());
+  };
+  static const std::vector<uint8_t> none(9, 0xEE);   // "not sent": never equal to a real payload
+  auto find = [&](uint8_t c) -> const std::vector<uint8_t> * {
+    for (auto &e : bus.log) if (e.first == c) return &e.second;
+    return &none;
+  };
+  auto has = [&](uint8_t c) { return find(c) != &none; };
+  // bounds and refusals send nothing
+  bus.log.clear();
+  CHECK(!epd.startNeutral(next, prev, 40, 60, 3, 11, 3));
+  CHECK(!epd.startNeutral(next, prev, 40, 60, 3, 11, 31));
+  CHECK(!epd.startNeutral(next, nullptr, 40, 60, 3, 11, 10));
+  CHECK(!epd.startNeutral(next, prev, 60, 60, 3, 11, 10));
+  CHECK(bus.log.empty());
+  CHECK(epd.neutralVcomCode() == 0x0A);
+  // the exact command order of one neutral partial, rails down afterwards
+  epd.stayPowered(false);
+  CHECK(epd.startNeutral(next, prev, 40, 60, 3, 11, 10));
+  CHECK(!epd.startNeutral(next, prev, 40, 60, 3, 11, 10));          // busy: refused
+  complete();
+  CHECK(epd.neutralActive() && epd.fastActive() && !epd.powered() && epd.neutralCount() == 1);
+  std::vector<uint8_t> order;
+  for (auto &e : bus.log) if (e.first != 0x71) order.push_back(e.first);
+  const std::vector<uint8_t> want = {0x00, 0x82, 0x50, 0xE0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x04,
+                                     0x91, 0x90, 0x10, 0x13, 0x12, 0x92, 0x02};
+  CHECK(order == want);
+  CHECK(*find(0x00) == std::vector<uint8_t>{0x3F});
+  CHECK(*find(0x82) == std::vector<uint8_t>{0x0A});
+  CHECK(*find(0x50) == (std::vector<uint8_t>{0x39, 0x07}));
+  CHECK(*find(0xE0) == std::vector<uint8_t>{0x00});
+  {
+    uint8_t c[60], ww[42], kw[60], wk[60], kk[60], bd[42];
+    CHECK(E::neutralTables(10, c, ww, kw, wk, kk, bd));
+    CHECK(*find(0x20) == std::vector<uint8_t>(c, c + 60));
+    CHECK(*find(0x21) == std::vector<uint8_t>(ww, ww + 42));
+    CHECK(*find(0x22) == std::vector<uint8_t>(kw, kw + 60));
+    CHECK(*find(0x23) == std::vector<uint8_t>(wk, wk + 60));
+    CHECK(*find(0x24) == std::vector<uint8_t>(kk, kk + 60));
+    CHECK(*find(0x25) == std::vector<uint8_t>(bd, bd + 42));
+  }
+  // window 24..87 x 40..59, PT_SCAN default 1; OLD = prev's window, NEW = next's window (invert off)
+  CHECK(*find(0x90) == (std::vector<uint8_t>{0x00, 24, 0x00, 87, 0x00, 40, 0x00, 59, 0x01}));
+  {
+    std::vector<uint8_t> wantOld, wantNew;
+    for (int y = 40; y < 60 && wantOld.size() < 256; y++)
+      for (int b = 3; b < 11 && wantOld.size() < 256; b++) {
+        wantOld.push_back(prev[y * 100 + b]);
+        wantNew.push_back(next[y * 100 + b]);
+      }
+    CHECK(*find(0x10) == wantOld && *find(0x13) == wantNew);
+  }
+  for (auto &e : bus.log) CHECK(e.first != 0xE5 && e.first != 0x2A && e.first != 0x01 && e.first != 0x06);
+  // window-only scan for NEUTRAL; FAST keeps its validated 1; factory follows the setting
+  epd.partialScanOutside(false);
+  bus.log.clear();
+  epd.stayPowered(true);
+  CHECK(epd.startNeutral(prev, next, 40, 60, 3, 11, 10)); complete();
+  CHECK((*find(0x90))[8] == 0x00 && has(0x04) && !has(0x02) && epd.powered());
+  bus.log.clear();
+  CHECK(epd.startNeutral(next, prev, 40, 60, 3, 11, 10)); complete();
+  CHECK(!has(0x04) && !has(0x02));                                 // rails kept up: no PON, no POF
+  bus.log.clear();
+  CHECK(epd.startFast(prev, next, 40, 60, 3, 11, 10)); complete();
+  CHECK((*find(0x90))[8] == 0x01 && !epd.neutralActive());
+  bus.log.clear();
+  CHECK(epd.startNeutral(next, prev, 40, 60, 3, 11, 10)); complete();
+  CHECK((*find(0x90))[8] == 0x00 && epd.neutralActive());
+  // VCOM clamp: never more negative than 0x0A; less negative allowed on the neutral path only
+  epd.neutralVcom(0x26);
+  CHECK(epd.neutralVcomCode() == 0x0A);
+  epd.neutralVcom(0x04);
+  CHECK(epd.neutralVcomCode() == 0x04);
+  bus.log.clear();
+  CHECK(epd.startNeutral(prev, next, 40, 60, 3, 11, 10)); complete();
+  CHECK(*find(0x82) == std::vector<uint8_t>{0x04});
+  epd.neutralVcom(0x0A);
+  // S4 exit: a factory partial after NEUTRAL powers off, resets, loads the vendor registers
+  bus.log.clear();
+  CHECK(epd.startPartial(next, prev, 40, 60, false, 3, 11)); complete();
+  CHECK(!epd.fastActive() && !epd.neutralActive());
+  CHECK(bus.log.size() > 2 && bus.log[0].first == 0x02);              // POF before the reset
+  CHECK(*find(0x00) == std::vector<uint8_t>{0x1F});    // vendor PSR again
+  CHECK((*find(0x90))[8] == 0x00);                                    // factory follows the setting
+  for (auto &e : bus.log) CHECK(e.first != 0x82);                     // no VDCS on the OTP path
+  epd.partialScanOutside(true);
+  // a stuck BUSY during NEUTRAL is a fault
+  CHECK(epd.startNeutral(next, prev, 40, 60, 3, 11, 10));
+  int guard = 0;
+  while (!epd.isIdle() && guard++ < 40000) { bus.t += 50; bus.busyUntil = bus.t + 100000; epd.poll(); }
+  CHECK(epd.faulted());
+}
+
 static void test_ghost() {
   const int W = 100, H = 24;                     // row bytes, rows (3 cell rows of 8)
   std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
@@ -527,6 +668,7 @@ int main(int argc, char **argv) {
   test_old_sync();
   test_idle_power();
   test_factory_power_bytes();
+  test_neutral();
   test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;

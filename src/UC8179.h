@@ -38,6 +38,8 @@
 //              a full refresh (which leaves DTM1 stale) still compares against what is
 //              really on the glass. Needs the caller's previous frame.
 //   - clean:   the full waveform inside a partial window: only that window flashes.
+//   - neutral: (bench) a register-LUT partial with zero field on unchanged pixels and the border,
+//              a DC-balanced drive for each transition and one constant VCOM (startNeutral).
 //  Partial refreshes accumulate ghosting. The policy is the caller's: EInkGhost.h keeps
 //  per-row wear and says PARTIAL / CLEAN / FULL; the driver counts partialsSinceFull().
 //
@@ -96,6 +98,7 @@ public:
     faulted_ = false;
     powered_ = false;                      // the reset took the rails down
     regLut_ = false;                       // and every register is the vendor's again
+    neutral_ = false;
   }
 
   // S4 exit: back to the vendor's registers after a fast (register-LUT) refresh. With the rails
@@ -257,6 +260,7 @@ public:
     fastLut(t60, 60, 0x00, 0);      cmdData(0x24, t60, 60);    // KK: never driven (S1)
     fastLut(t42, 42, 0x00, 0);      cmdData(0x25, t42, 42);    // BD: never driven (S1)
     regLut_ = true;
+    neutral_ = false;
     powerOn();
     return true;
   }
@@ -286,16 +290,118 @@ public:
     fastLut(t60, 60, 0x00, 0);      cmdData(0x24, t60, 60);
     fastLut(t42, 42, 0x00, 0);      cmdData(0x25, t42, 42);
     regLut_ = true;
+    neutral_ = false;
     powerOn();
     return true;
   }
+  // NEUTRAL partial (2026-10-01, the global-haze work; BENCH-SELECTED, never a default). A register
+  // LUT partial for EVERY routine update, so no partial ever runs the undocumented OTP partial bin
+  // (forced temperature 0x6E), whose untouched-pixel drive, VCOM phases, XON all-gate-on states,
+  // VCOM_DC and rail voltages come from the OTP TR and cannot be seen or changed (UC8179c C0.6
+  // "LUT format in OTP" p.50: each TR carries its own frame rate, VG/VDH/VDL, XON, VCOM_DC).
+  //   N1  Unchanged pixels and the border are held at zero field: WW = KK = 00 (GND) and LUTBD = 00
+  //       (VCOM) for every frame of the refresh -- same timing as the drive, so nothing ends early.
+  //   N2  Every transition is DC-balanced on its own: K->W = VDH x n, then VDL x n; W->K = VDL x n,
+  //       then VDH x n. The first phase pushes the pixel further into the state it is already in
+  //       (no visible change), the second drives it across; the volt-frames sum to zero for each
+  //       transition, not only over a K->W->K cycle as the FAST LUT's single phase does.
+  //   N3  VCOM is one constant level for the whole drive (LUTC 00 = VCOM_DC, never 01/10 AC, never
+  //       11 floating), at VDCS neutralVcom() -- by default 0x0A (-0.60 V), the value production
+  //       already runs on the FAST path. Never more negative than that (the measured drift on
+  //       untouched glass grew with |VCOM|: research 2026-09-23 sweep).
+  //   N4  Bounded: n in [NEUTRAL_MIN_FRAMES, NEUTRAL_MAX_FRAMES] per phase, rails as begin() set
+  //       them (0x01 untouched: VDH/VDL +-15 V), no VDHR (11b) anywhere, no XON (0x2A never written).
+  //   N5  Gate scan follows partialScanOutside(): 0 confines the scan to the window rows.
+  //   N6  The next OTP refresh of any kind begins with leaveFast() (POF, reset, vendor registers),
+  //       exactly like FAST (S4). A BUSY timeout is a fault like any other.
+  // lutBalanced() checks N1-N4's arithmetic on the bytes actually sent; startNeutral refuses
+  // (sends nothing) if a table ever fails it.
+  static constexpr uint8_t NEUTRAL_MIN_FRAMES = 4, NEUTRAL_MAX_FRAMES = 30;
+  // Two groups of one phase each: group 0 at `first`, group 1 at `second`, both `frames` long,
+  // repeated once; groups 2.. zero (the end condition: "all Number of Frames = 0").
+  static void neutralLut(uint8_t *out, size_t len, uint8_t first, uint8_t second, uint8_t frames) {
+    memset(out, 0, len);
+    out[0] = first;  out[1] = frames; out[5] = 1;
+    out[6] = second; out[7] = frames; out[11] = 1;
+  }
+  // Net source drive of a source LUT, in frames: +1 per VDH frame, -1 per VDL frame, x repeat.
+  // Returns INT32_MIN when any phase that has frames selects 11b (VDHR / floating).
+  static int32_t lutNetFrames(const uint8_t *t, size_t len) {
+    int32_t net = 0;
+    for (size_t g = 0; g + 6 <= len; g += 6)
+      for (int ph = 0; ph < 4; ph++) {
+        const uint8_t lvl = (uint8_t) ((t[g] >> (6 - 2 * ph)) & 3), fr = t[g + 1 + ph];
+        if (!fr || !t[g + 5]) continue;
+        if (lvl == 3) return INT32_MIN;
+        net += (lvl == 1 ? 1 : lvl == 2 ? -1 : 0) * (int32_t) fr * (int32_t) t[g + 5];
+      }
+    return net;
+  }
+  // True when every phase that runs selects level 00 (GND for a source LUT, VCOM_DC / VCOM for
+  // LUTC / LUTBD): a table that applies no field at all.
+  static bool lutAllZeroLevel(const uint8_t *t, size_t len) {
+    for (size_t g = 0; g + 6 <= len; g += 6)
+      for (int ph = 0; ph < 4; ph++)
+        if (t[g + 1 + ph] && t[g + 5] && ((t[g] >> (6 - 2 * ph)) & 3)) return false;
+    return true;
+  }
+  // Fills the six tables startNeutral sends (VCOM 60, WW 42, KW 60, WK 60, KK 60, BD 42) and checks
+  // them; false = refuse. Public so the host test sees exactly the bytes that go out.
+  static bool neutralTables(uint8_t frames, uint8_t *c60, uint8_t *ww42, uint8_t *kw60, uint8_t *wk60,
+                            uint8_t *kk60, uint8_t *bd42) {
+    if (frames < NEUTRAL_MIN_FRAMES || frames > NEUTRAL_MAX_FRAMES) return false;
+    neutralLut(c60, 60, 0x00, 0x00, frames);                       // N3: VCOM_DC, both groups
+    neutralLut(ww42, 42, 0x00, 0x00, frames);                      // N1: W->W at GND
+    neutralLut(kw60, 60, LVL_TO_BLACK, LVL_TO_WHITE, frames);      // N2: K->W: VDH n, VDL n
+    neutralLut(wk60, 60, LVL_TO_WHITE, LVL_TO_BLACK, frames);      // N2: W->K: VDL n, VDH n
+    neutralLut(kk60, 60, 0x00, 0x00, frames);                      // N1: K->K at GND
+    neutralLut(bd42, 42, 0x00, 0x00, frames);                      // N1: border at VCOM
+    return lutNetFrames(kw60, 60) == 0 && lutNetFrames(wk60, 60) == 0 &&
+           lutAllZeroLevel(c60, 60) && lutAllZeroLevel(ww42, 42) && lutAllZeroLevel(kk60, 60) &&
+           lutAllZeroLevel(bd42, 42);
+  }
+  bool startNeutral(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1, uint8_t frames) {
+    if (step_ != Step::IDLE || !prev || !frame) return false;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (xb0 < 0) xb0 = 0;
+    if (xb1 > ROW) xb1 = ROW;
+    if (y0 >= y1 || xb0 >= xb1) return false;
+    uint8_t c60[60], ww42[42], kw60[60], wk60[60], kk60[60], bd42[42];
+    if (!neutralTables(frames, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    full_ = false; clean_ = false; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
+    xb0_ = xb0; xb1_ = xb1;
+    cmd(0x00, {0x3F});                     // PSR: LUT from register, KW mode (as FAST)
+    cmd(0x82, {neutralVcom_});             // N3: VCOM_DC explicit, never more negative than 0x0A
+    cmd(0x50, {FAST_CDI, 0x07});           // border -> LUTBD (level 00 = VCOM: no field), N2OCP=1
+    cmd(0xE0, {0x00});                     // no forced temperature
+    cmdData(0x20, c60, 60);
+    cmdData(0x21, ww42, 42);
+    cmdData(0x22, kw60, 60);
+    cmdData(0x23, wk60, 60);
+    cmdData(0x24, kk60, 60);
+    cmdData(0x25, bd42, 42);
+    regLut_ = true;
+    neutral_ = true;
+    neutralCount_++;
+    powerOn();
+    return true;
+  }
+  // VDCS for the neutral path only: clamped to 0x00..FAST_VCOM_MIN (-0.10 .. -0.60 V), so it can
+  // never be more negative than production's FAST value. Default FAST_VCOM_MIN. Takes effect at the
+  // next startNeutral (no command is sent here).
+  void neutralVcom(uint8_t code) { neutralVcom_ = code > FAST_VCOM_MIN ? FAST_VCOM_MIN : code; }
+  uint8_t neutralVcomCode() const { return neutralVcom_; }
+  bool neutralActive() const { return regLut_ && neutral_; }
+  uint32_t neutralCount() const { return neutralCount_; }
+
   // Rail power-ups since begin() (research S9: rail cycles are counted per session).
   uint32_t railCycles() const { return railCycles_; }
   bool fastActive() const { return regLut_; }
 
   // BENCH: factory partial gate coverage (UC8179c C0.6, R90H PT_SCAN).
   // Default 1 scans gates inside AND outside the window; 0 only inside.
-  // Register-LUT FAST/NULL paths always retain their validated scan=1.
+  // Register-LUT FAST/NULL paths always retain their validated scan=1; NEUTRAL follows this.
   void partialScanOutside(bool on) { scanOutside_ = on; }
   bool partialScanOutside() const { return scanOutside_; }
 
@@ -396,6 +502,9 @@ private:
   bool offBeforeReset_ = true;  // leaveFast(): power off before the S4 reset
   bool scanOutside_ = true;  // factory PT_SCAN only; default unchanged
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
+  bool neutral_ = false;      // ... and they are the NEUTRAL set (scan follows scanOutside_)
+  uint8_t neutralVcom_ = FAST_VCOM_MIN;
+  uint32_t neutralCount_ = 0;
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
   int factoryVcom_ = -1;
   uint32_t railCycles_ = 0;
@@ -445,6 +554,9 @@ private:
     cmd(0x04);                             // power on; BUSY until the rails are up
     enter(Step::POWER_WAIT, SETTLE_MS);
   }
+  // PTL PT_SCAN (UC8179c C0.6 R90H): FAST/NULL keep their validated 1; factory and NEUTRAL
+  // partials follow partialScanOutside().
+  uint8_t scanByte() const { return (uint8_t) ((regLut_ && !neutral_) || scanOutside_ ? 0x01 : 0x00); }
   // The window's bytes, row after row, batched into as few bus writes as the buffer allows.
   void sendRows(uint8_t reg, const uint8_t *src, bool invert) {
     cmd(reg);
@@ -467,7 +579,7 @@ private:
       const uint16_t xa = (uint16_t)(xb0_ * 8), xe = (uint16_t)(xb1_ * 8 - 1);
       const uint16_t ya = (uint16_t)y0_, yb = (uint16_t)(y1_ - 1);
       cmd(0x90, {(uint8_t)(xa >> 8), (uint8_t)(xa & 0xFF), (uint8_t)(xe >> 8), (uint8_t)(xe & 0xFF),
-                 (uint8_t)(ya >> 8), (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), (uint8_t)(regLut_ || scanOutside_ ? 0x01 : 0x00)});
+                 (uint8_t)(ya >> 8), (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), scanByte()});
       sendRows(0x10, prev_, invert_);      // what is on the glass (old)
       sendRows(0x13, frame_, invert_);     // what should be (new)
     }
