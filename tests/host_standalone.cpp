@@ -206,6 +206,172 @@ static void test_uc8179() {
   CHECK(epd.faulted());
 }
 
+static void test_factory_scan() {
+  SimBus bus;
+  UC8179<SimBus> epd(bus);
+  epd.begin();
+  static uint8_t a[48000], b[48000];
+  auto complete = [&]() {
+    int guard = 0;
+    while (!epd.isIdle() && guard++ < 5000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.isIdle() && !epd.faulted());
+  };
+  auto scan = [&]() -> int {
+    for (auto i = bus.log.rbegin(); i != bus.log.rend(); ++i)
+      if (i->first == 0x90 && i->second.size() == 9) return i->second[8];
+    return -1;
+  };
+  auto vcomWritten = [&]() {
+    for (const auto &i : bus.log) if (i.first == 0x82) return true;
+    return false;
+  };
+  CHECK(epd.partialScanOutside());
+  bus.log.clear();
+  CHECK(epd.startPartial(b, a, 44, 124, false, 3, 63)); complete();
+  CHECK(scan() == 1 && !vcomWritten());
+  bus.log.clear();
+  epd.partialScanOutside(false);
+  CHECK(!epd.partialScanOutside() && bus.log.empty());  // setter never writes voltage/registers
+  CHECK(epd.startPartial(b, a, 44, 124, false, 3, 63)); complete();
+  CHECK(scan() == 0 && !vcomWritten());
+  bus.log.clear();
+  CHECK(epd.startFull(b)); complete();
+  CHECK(scan() == -1 && !vcomWritten());                // full refresh unaffected
+  bus.log.clear();
+  CHECK(epd.startFast(b, a, 44, 124, 3, 63, 4)); complete();
+  CHECK(scan() == 1);                                  // validated FAST scan unchanged
+  bus.log.clear();
+  CHECK(epd.startPartial(b, a, 44, 124, false, 3, 63)); complete();
+  CHECK(scan() == 0 && !vcomWritten());                  // factory selection survives FAST reset
+  epd.partialScanOutside(true);
+  bus.log.clear();
+  CHECK(epd.startPartial(b, a, 44, 124, false, 3, 63)); complete();
+  CHECK(scan() == 1 && !vcomWritten());                  // explicit rollback
+}
+
+static void test_factory_power_bytes() {
+  std::vector<std::pair<uint8_t,std::vector<uint8_t>>> reference;
+  static uint8_t a[48000],b[48000]; memset(b,0x55,sizeof(b));
+  for(bool down:{false,true}) {
+    SimBus bus; UC8179<SimBus> epd(bus);epd.begin();epd.stayPowered(!down);
+    bus.cmds.clear();bus.log.clear();bus.dataBytes=0;
+    for(int n=0;n<3;++n) {
+      CHECK(epd.startPartial(b,a,40,60,false,3,11));
+      for(int guard=0;guard<2000 && !epd.isIdle();++guard){bus.t+=5;epd.poll();}
+      CHECK(epd.isIdle() && !epd.faulted());
+      CHECK(down ? !epd.powered() && epd.lastTiming().off>0 : epd.powered() && epd.lastTiming().off==0);
+    }
+    int pon=0,pof=0;std::vector<std::pair<uint8_t,std::vector<uint8_t>>> content;
+    for(auto &entry:bus.log) {
+      pon+=entry.first==0x04;pof+=entry.first==0x02;
+      if(entry.first!=0x04 && entry.first!=0x02 && entry.first!=0x71) content.push_back(entry);
+      CHECK(entry.first!=0x82 && !(entry.first>=0x20 && entry.first<=0x25));
+      if(entry.first==0xE0) CHECK(entry.second==std::vector<uint8_t>{0x02});
+      if(entry.first==0xE5) CHECK(entry.second==std::vector<uint8_t>{0x6E});
+    }
+    CHECK(pon==(down?3:1) && pof==(down?3:0));
+    if(!down)reference=content;else CHECK(content==reference);  // exact windows/payloads/LUT/bin unchanged
+  }
+}
+
+static void test_idle_power() {
+  SimBus bus; UC8179<SimBus> epd(bus); epd.begin();
+  bus.cmds.clear(); bus.dataBytes = 0;
+  CHECK(epd.powerUpWithoutRefresh());
+  CHECK(bus.cmds == std::vector<uint8_t>{0x04});
+  CHECK(!epd.powerUpWithoutRefresh());
+  for (int i=0; i<100 && !epd.isIdle(); ++i) { bus.t+=10; epd.poll(); }
+  CHECK(epd.isIdle() && epd.powered() && !epd.faulted());
+  CHECK(bus.dataBytes == 0 && epd.partialsSinceFull()==0);
+  for (auto c:bus.cmds) CHECK(c==0x04 || c==0x71);
+  bus.cmds.clear(); CHECK(epd.powerUpWithoutRefresh() && bus.cmds.empty());
+  epd.powerDown(); CHECK(bus.cmds == std::vector<uint8_t>{0x02});
+  for(int i=0;i<100 && !epd.isIdle();++i){bus.t+=10;epd.poll();}
+  CHECK(!epd.powered());
+  bus.cmds.clear();bus.busyUntil=bus.t+100;
+  CHECK(!epd.powerUpWithoutRefresh() && bus.cmds.empty());
+  bus.t+=100; CHECK(epd.powerUpWithoutRefresh());
+  bus.busyUntil=bus.t+20000;bus.t+=13000;epd.poll();
+  CHECK(epd.faulted() && bus.cmds.back()==0x02);
+  bus.t+=30;epd.poll();
+  CHECK(epd.isIdle() && epd.faulted() && !epd.powered());
+  bus.cmds.clear(); CHECK(!epd.powerUpWithoutRefresh() && bus.cmds.empty());
+  bus.t+=20000;epd.begin();static uint8_t a[48000],b[48000];
+  CHECK(epd.startFast(b,a,44,124,3,63,4));
+  for(int i=0;i<2000 && !epd.isIdle();++i){bus.t+=10;epd.poll();}
+  bus.cmds.clear(); CHECK(!epd.powerUpWithoutRefresh() && bus.cmds.empty());
+  epd.leaveFast();CHECK(epd.startNull(a,0,8,0,1,4));
+  for(int i=0;i<2000 && !epd.isIdle();++i){bus.t+=10;epd.poll();}
+  bus.cmds.clear(); CHECK(!epd.powerUpWithoutRefresh() && bus.cmds.empty());
+}
+
+static void test_old_sync() {
+  struct CaptureBus : SimBus {
+    std::vector<uint8_t> old;
+    bool autoBusy = false;
+    void data(const uint8_t *p, size_t n) {
+      SimBus::data(p, n);
+      if (!log.empty() && log.back().first == 0x10) {
+        old.insert(old.end(), p, p + n);
+        if (autoBusy && old.size() >= 48000) busyUntil = t + 900;
+      }
+    }
+  } bus;
+  UC8179<CaptureBus> epd(bus);
+  epd.begin();
+  std::vector<uint8_t> glass(48000), next(48000);
+  for (size_t i = 0; i < glass.size(); ++i) glass[i] = (uint8_t)(i * 37 + i / 100);
+  auto complete = [&]() {
+    int guard = 0;
+    while (!epd.isIdle() && guard++ < 5000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.isIdle() && !epd.faulted());
+  };
+  auto clear = [&]() { bus.log.clear(); bus.cmds.clear(); bus.old.clear(); bus.dataBytes = 0; };
+  for (bool inv : {false, true}) {
+    epd.invert(inv);
+    clear();
+    auto count = epd.partialsSinceFull();
+    auto last = epd.lastRefreshMs();
+    auto powered = epd.powered();
+    CHECK(epd.syncOld(glass.data()));
+    CHECK(bus.cmds == std::vector<uint8_t>({0x91, 0x90, 0x10, 0x92}));
+    CHECK(bus.log[1].second == std::vector<uint8_t>({0,0,3,31,0,0,1,223,1}));
+    CHECK(bus.old.size() == glass.size());
+    for (size_t i = 0; i < glass.size(); ++i) CHECK(bus.old[i] == (inv ? (uint8_t)~glass[i] : glass[i]));
+    CHECK(epd.isIdle() && epd.powered() == powered && epd.partialsSinceFull() == count && epd.lastRefreshMs() == last);
+  }
+  clear(); CHECK(!epd.syncOld(nullptr) && bus.cmds.empty());
+  bus.busyUntil = bus.t + 100;
+  clear(); CHECK(!epd.syncOld(glass.data()) && bus.cmds.empty());
+  bus.t += 100;
+  epd.stayPowered(true);
+  CHECK(epd.startPartial(next.data(), glass.data(), 44, 124, false, 3, 63));
+  clear(); CHECK(!epd.syncOld(glass.data()) && bus.cmds.empty());
+  complete();
+  CHECK(epd.powered());
+  clear(); CHECK(epd.syncOld(glass.data()) && epd.powered());  // no power change while rails up
+  epd.partialScanOutside(false);
+  clear(); CHECK(epd.startPartial(next.data(), glass.data(), 44, 124, false, 3, 63));
+  CHECK(bus.log[0].first == 0x50); complete();
+  bool narrow = false;
+  for (const auto &entry : bus.log) if (entry.first == 0x90) narrow = entry.second == std::vector<uint8_t>({0,24,1,247,0,44,0,123,0});
+  CHECK(narrow);
+  clear(); CHECK(epd.syncOld(glass.data()));
+  CHECK(bus.log[1].second[8] == 0);
+  CHECK(epd.startFast(next.data(), glass.data(), 44,124,3,63,4)); complete();
+  clear(); CHECK(!epd.syncOld(glass.data()) && bus.cmds.empty());
+  CHECK(epd.startPartial(next.data(), glass.data(),44,124,false,3,63)); complete();
+  clear(); bus.autoBusy = true;
+  CHECK(epd.syncOld(glass.data()));
+  CHECK(epd.isIdle() && epd.controllerBusy());  // software idle alone is NOT no-refresh proof
+  clear(); CHECK(!epd.syncOld(glass.data()) && bus.cmds.empty());
+  bus.autoBusy = false; bus.t += 1000;
+  CHECK(epd.startPartial(next.data(), glass.data(),44,124,false,3,63));
+  bus.busyUntil = bus.t + 100000; bus.t += 13000; epd.poll();
+  CHECK(epd.faulted());
+  clear(); CHECK(!epd.syncOld(glass.data()) && bus.cmds.empty());
+}
+
 static void test_ghost() {
   const int W = 100, H = 24;                     // row bytes, rows (3 cell rows of 8)
   std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
@@ -357,6 +523,10 @@ int main(int argc, char **argv) {
   test_prle_image(argc > 3 ? argv[1] : nullptr, argc > 3 ? atoi(argv[2]) : 37, argc > 3 ? atoi(argv[3]) : 11);
   test_uc8179();
   test_fast();
+  test_factory_scan();
+  test_old_sync();
+  test_idle_power();
+  test_factory_power_bytes();
   test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;

@@ -58,7 +58,7 @@ public:
   static constexpr int W = 800, H = 480, ROW = W / 8;
   static constexpr uint32_t BUSY_TIMEOUT_MS = 12000;   // a full refresh is ~4 s; this is a fault
 
-  enum class Step : uint8_t { IDLE, POWER_WAIT, REFRESH_WAIT, OFF_WAIT };
+  enum class Step : uint8_t { IDLE, POWER_WAIT, REFRESH_WAIT, OFF_WAIT, IDLE_POWER_WAIT, IDLE_OFF_WAIT };
   // Where the last refresh spent its time, ms: rails up, SPI, waveform, rails down.
   struct Timing { uint16_t power, send, refresh, off; };
 
@@ -117,9 +117,35 @@ public:
   bool isIdle() const { return step_ == Step::IDLE; }
   Step step() const { return step_; }
   bool faulted() const { return faulted_; }
+  // BENCH ONLY: enable factory drive without writing pixels or starting a waveform.
+  bool powerUpWithoutRefresh() {
+    if (!isIdle() || faulted_ || regLut_ || bus_.busy()) return false;
+    if (powered_) return true;
+    railCycles_++;
+    cmd(0x04);
+    enter(Step::IDLE_POWER_WAIT, SETTLE_MS);
+    return true;
+  }
+  bool controllerBusy() { return bus_.busy(); }  // physical BUSY pin, independent of software step
   uint32_t partialsSinceFull() const { return partials_; }
   uint32_t lastRefreshMs() const { return lastMs_; }   // duration of the last completed refresh
   const Timing &lastTiming() const { return timing_; }
+
+  // BENCH: synchronize OLD SRAM to the completed physical frame, without a refresh.
+  // Established writeImageToPrevious sequence: partial in, full RAM window, DTM1, partial out.
+  // Refuse registered LUTs instead of resetting them; this operation changes no power/voltage.
+  bool syncOld(const uint8_t *glass) {
+    if (step_ != Step::IDLE || faulted_ || regLut_ || !glass || bus_.busy()) return false;
+    const int saveY0 = y0_, saveY1 = y1_, saveX0 = xb0_, saveX1 = xb1_;
+    y0_ = 0; y1_ = H; xb0_ = 0; xb1_ = ROW;
+    cmd(0x91);
+    cmd(0x90, {0x00, 0x00, 0x03, 0x1F, 0x00, 0x00, 0x01, 0xDF,
+               (uint8_t)(scanOutside_ ? 0x01 : 0x00)});
+    sendRows(0x10, glass, invert_);
+    cmd(0x92);  // no 0x11 Data Stop or 0x12 refresh
+    y0_ = saveY0; y1_ = saveY1; xb0_ = saveX0; xb1_ = saveX1;
+    return true;
+  }
 
   // STAY POWERED: skip the power-off after a refresh (and so the power-on before the next), for a
   // run of frequent updates -- a ticking track position. Rails up/down cost ~100-200 ms of every
@@ -267,6 +293,12 @@ public:
   uint32_t railCycles() const { return railCycles_; }
   bool fastActive() const { return regLut_; }
 
+  // BENCH: factory partial gate coverage (UC8179c C0.6, R90H PT_SCAN).
+  // Default 1 scans gates inside AND outside the window; 0 only inside.
+  // Register-LUT FAST/NULL paths always retain their validated scan=1.
+  void partialScanOutside(bool on) { scanOutside_ = on; }
+  bool partialScanOutside() const { return scanOutside_; }
+
   // The fast path's VCOM (research S3). VDCS code (0x82): V = -0.10 - 0.05 * code; limited to
   // FAST_VCOM_MIN..0x40 (-0.60 .. -3.30 V) for the long-form sweep of 2026-09-23. `table`: 0 = the VCOM LUT holds VCOM_DC for the phase (default),
   // 1 = an all-zero VCOM LUT (no VCOM group at all). Floating (11b) is never used.
@@ -288,11 +320,26 @@ public:
     const uint32_t now = bus_.millis();
     if ((int32_t)(now - notBefore_) < 0) return;
     if (bus_.busy()) {
-      if (now - stepStart_ > BUSY_TIMEOUT_MS) { faulted_ = true; step_ = Step::IDLE; return; }
+      if (now - stepStart_ > BUSY_TIMEOUT_MS) {
+        faulted_ = true;
+        if (step_ == Step::IDLE_POWER_WAIT) {
+          cmd(0x02);  // failed bench-only PON: attempt proper drive-off, never a waveform
+          enter(Step::IDLE_OFF_WAIT, 0);
+        } else step_ = Step::IDLE;
+        return;
+      }
       if (now - lastStatus_ >= 10) { cmd(0x71); lastStatus_ = now; }  // V2 wants status polls
       return;
     }
     switch (step_) {
+      case Step::IDLE_OFF_WAIT:
+        powered_ = false;
+        step_ = Step::IDLE;
+        break;
+      case Step::IDLE_POWER_WAIT:
+        powered_ = true;
+        step_ = Step::IDLE;
+        break;
       case Step::POWER_WAIT: {
         powered_ = true;
         timing_.power = (uint16_t)(now - started_);
@@ -347,6 +394,7 @@ private:
   Timing timing_{0, 0, 0, 0};
   uint8_t partialTemp_ = 0x6E;
   bool offBeforeReset_ = true;  // leaveFast(): power off before the S4 reset
+  bool scanOutside_ = true;  // factory PT_SCAN only; default unchanged
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
   int factoryVcom_ = -1;
@@ -419,7 +467,7 @@ private:
       const uint16_t xa = (uint16_t)(xb0_ * 8), xe = (uint16_t)(xb1_ * 8 - 1);
       const uint16_t ya = (uint16_t)y0_, yb = (uint16_t)(y1_ - 1);
       cmd(0x90, {(uint8_t)(xa >> 8), (uint8_t)(xa & 0xFF), (uint8_t)(xe >> 8), (uint8_t)(xe & 0xFF),
-                 (uint8_t)(ya >> 8), (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), 0x01});
+                 (uint8_t)(ya >> 8), (uint8_t)(ya & 0xFF), (uint8_t)(yb >> 8), (uint8_t)(yb & 0xFF), (uint8_t)(regLut_ || scanOutside_ ? 0x01 : 0x00)});
       sendRows(0x10, prev_, invert_);      // what is on the glass (old)
       sendRows(0x13, frame_, invert_);     // what should be (new)
     }
