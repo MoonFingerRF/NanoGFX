@@ -666,7 +666,7 @@ static void test_copy() {
     CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, bad, kk, 0x12));
     uint8_t lc[42] = {0x00, 100, 0, 0, 0, 1, 0x00, 21, 0, 0, 0, 1}, lk[42] = {0x40, 100, 0, 0, 0, 1, 0x80, 21, 0, 0, 0, 1};
     CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, lc, lc, lk, lk, lc, 0x12));   // 121 frames
-    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x09));   // VCOM -0.55
+    // VCOM floor is 0x00 (-0.10 V, the lowest VDCS code): nothing below it to refuse.
     CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x27));   // VCOM -2.05
     CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x12, 0x11));   // CDI
     CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x12, 0x19, 0x01)); // EVS

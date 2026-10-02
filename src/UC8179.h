@@ -462,12 +462,12 @@ public:
   //   C2  LUTC is VCOM_DC only (level 00): no AC VCOM, no floating;
   //   C3  every table has LUTC's exact frame/repeat bytes (the tables run in lockstep);
   //   C4  the drive is at most COPY_MAX_FRAMES frames long;
-  //   C5  VDCS in [COPY_VCOM_MIN, COPY_VCOM_MAX] (-0.60 .. -2.00 V, values this driver already uses);
+  //   C5  VDCS in [COPY_VCOM_MIN, COPY_VCOM_MAX] (-0.10 .. -2.00 V; 0x00 = controller floor, owner-approved bench 2026-10-02);
   //   C6  CDI is the factory partial's 0x19 (border -> LUTWK, N2OCP, DDX=01) or FAST_CDI 0x39 (border
   //       -> a zero LUTBD); EVS is 0 (not written), 0x02 (default) or 0x03 (border floats at the end).
   // Rails (0x01/0x06), frame rate (0x30) and XON (0x2A) are never written: the vendor values after
   // begin() are the OTP TR's (VDH/VDL 15 V, VG 20 V, 50 Hz, no XON) -- the caller checks its dump.
-  static constexpr uint8_t COPY_VCOM_MIN = FAST_VCOM_MIN, COPY_VCOM_MAX = FAST_VCOM_DC, COPY_MAX_FRAMES = 120;
+  static constexpr uint8_t COPY_VCOM_MIN = 0x00, COPY_VCOM_MAX = FAST_VCOM_DC, COPY_MAX_FRAMES = 120;
   static int copyFrames(const uint8_t *t42) {           // frames until the end condition
     int n = 0;
     for (int g = 0; g < 7; g++) {
