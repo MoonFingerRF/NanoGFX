@@ -39,6 +39,7 @@ what a small MCU can drive:
 | ST7789 SPI TFTs (240×240/280/320) | `ST7789.h` (ESP32) | same pipeline, RGB444 wire option |
 | RGB parallel panels (ST7701S etc., LCD_CAM) | none needed | decode dirty rows into the scanned framebuffer |
 | **UC8179 7.5" e-paper, 800×480** (Seeed reTerminal E1001, Waveshare 7.5" V2, GoodDisplay GDEY075T7) | `UC8179.h` (any MCU, your bus) | non-blocking full / partial / clean-window refresh |
+| **SSD1677 3.97" e-paper, 800×480** (Waveshare ESP32-S3-ePaper-3.97, GoodDisplay GDEM0397T81) | `SSD1677.h` (any MCU, your bus) | non-blocking full / OTP partial refresh, landscape or portrait frames (tests/ssd1677_host.cpp) |
 | Any other 1-bit panel (SSD16xx e-paper, mono OLED/LCD) | your driver | `PackMono` exports MSB-first 1-bit rows |
 
 ## The pieces
