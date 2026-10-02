@@ -626,6 +626,85 @@ static void test_pair() {
   CHECK(!epd.pairActive() && !epd.fastActive() && bus.log[0].first == 0x02);         // S4 exit fence
 }
 
+// OTP COPY (2026-10-01): a factory KW table set, sent byte for byte (padded to the register
+// lengths), with only VDCS/CDI/EVS from the caller; every refusal rule sends nothing.
+static void test_copy() {
+  typedef UC8179<SimBus> E;
+  // the shape of the panel's partial: 3 + 15 + 5 + 5, then 6 + 3 frames
+  const uint8_t c[42] = {0x00, 3, 15, 5, 5, 1, 0x00, 6, 3, 0, 0, 1};
+  const uint8_t ww[42] = {0x00, 3, 15, 5, 5, 1, 0x00, 6, 3, 0, 0, 1};
+  const uint8_t kw[42] = {0x2A, 3, 15, 5, 5, 1, 0xA0, 6, 3, 0, 0, 1};
+  const uint8_t wk[42] = {0x15, 3, 15, 5, 5, 1, 0x00, 6, 3, 0, 0, 1};
+  const uint8_t kk[42] = {0x40, 3, 15, 5, 5, 1, 0x00, 6, 3, 0, 0, 1};
+  CHECK(E::copyFrames(c) == 37 && E::copyTablesOk(c, ww, kw, wk, kk));
+  SimBus bus;
+  E epd(bus);
+  epd.begin();
+  static uint8_t prev[48000], next[48000];
+  for (size_t i = 0; i < sizeof next; i++) next[i] = (uint8_t) (i * 7);
+  auto complete = [&]() {
+    int guard = 0;
+    while (!epd.isIdle() && guard++ < 5000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.isIdle() && !epd.faulted());
+  };
+  static const std::vector<uint8_t> none(9, 0xEE);
+  auto find = [&](uint8_t cm) -> const std::vector<uint8_t> * {
+    for (auto &e : bus.log) if (e.first == cm) return &e.second;
+    return &none;
+  };
+  // refusals send nothing
+  bus.log.clear();
+  {
+    uint8_t bad[42];
+    memcpy(bad, kw, 42); bad[0] = 0xEA;                   // phase 0 = 11b (VDHR)
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, bad, wk, kk, 0x12));
+    memcpy(bad, c, 42); bad[0] = 0x40;                    // VCOM AC (VCOMH)
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, bad, ww, kw, wk, kk, 0x12));
+    memcpy(bad, c, 42); bad[0] = 0xC0;                    // VCOM floating
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, bad, ww, kw, wk, kk, 0x12));
+    memcpy(bad, wk, 42); bad[2] = 16;                     // timing differs from LUTC
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, bad, kk, 0x12));
+    uint8_t lc[42] = {0x00, 100, 0, 0, 0, 1, 0x00, 21, 0, 0, 0, 1}, lk[42] = {0x40, 100, 0, 0, 0, 1, 0x80, 21, 0, 0, 0, 1};
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, lc, lc, lk, lk, lc, 0x12));   // 121 frames
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x09));   // VCOM -0.55
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x27));   // VCOM -2.05
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x12, 0x11));   // CDI
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x12, 0x19, 0x01)); // EVS
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, nullptr, 0x12));
+  }
+  CHECK(bus.log.empty());
+  // the exact bytes
+  epd.stayPowered(false);
+  CHECK(epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x26, 0x19, 0x03));
+  complete();
+  CHECK(epd.copyActive() && epd.neutralActive() && !epd.pairActive() && epd.copyCount() == 1);
+  std::vector<uint8_t> order;
+  for (auto &e : bus.log) if (e.first != 0x71) order.push_back(e.first);
+  CHECK(order == (std::vector<uint8_t>{0x00, 0x82, 0x50, 0x52, 0xE0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x04,
+                                       0x91, 0x90, 0x10, 0x13, 0x12, 0x92, 0x02}));
+  CHECK(*find(0x82) == std::vector<uint8_t>{0x26} && *find(0x50) == (std::vector<uint8_t>{0x19, 0x07}));
+  CHECK(*find(0x52) == std::vector<uint8_t>{0x03} && *find(0x00) == std::vector<uint8_t>{0x3F});
+  auto pad = [](const uint8_t *t, size_t n) { std::vector<uint8_t> v(t, t + 42); v.resize(n, 0); return v; };
+  CHECK(*find(0x20) == pad(c, 60) && *find(0x21) == pad(ww, 42) && *find(0x22) == pad(kw, 60));
+  CHECK(*find(0x23) == pad(wk, 60) && *find(0x24) == pad(kk, 60) && *find(0x25) == std::vector<uint8_t>(42, 0));
+  for (auto &e : bus.log) CHECK(e.first != 0xE5 && e.first != 0x2A && e.first != 0x01 && e.first != 0x06 && e.first != 0x30);
+  CHECK((*find(0x90))[8] == 0x01);
+  // EVS 0 is not written; scan follows the setting; the next NEUTRAL clears the copy flag
+  epd.partialScanOutside(false);
+  bus.log.clear();
+  CHECK(epd.startOtpCopy(prev, next, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x12)); complete();
+  CHECK(find(0x52) == &none && (*find(0x90))[8] == 0x00 && *find(0x82) == std::vector<uint8_t>{0x12});
+  CHECK(epd.startNeutral(next, prev, 40, 60, 3, 11, 10)); complete();
+  CHECK(!epd.copyActive() && epd.neutralActive());
+  epd.partialScanOutside(true);
+  // S4 exit fence before any OTP refresh
+  epd.stayPowered(true);
+  CHECK(epd.startOtpCopy(prev, next, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x12)); complete();
+  bus.log.clear();
+  CHECK(epd.startPartial(next, prev, 40, 60, false, 3, 11)); complete();
+  CHECK(!epd.copyActive() && !epd.fastActive() && bus.log[0].first == 0x02 && *find(0x00) == std::vector<uint8_t>{0x1F});
+}
+
 static void test_ghost() {
   const int W = 100, H = 24;                     // row bytes, rows (3 cell rows of 8)
   std::vector<uint8_t> glass(W * H, 0), frame(W * H, 0);
@@ -783,6 +862,7 @@ int main(int argc, char **argv) {
   test_factory_power_bytes();
   test_neutral();
   test_pair();
+  test_copy();
   test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;

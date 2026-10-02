@@ -363,7 +363,8 @@ public:
   bool startNeutral(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1, uint8_t frames) {
     uint8_t c60[60], ww42[42], kw60[60], wk60[60], kk60[60], bd42[42];
     if (!neutralTables(frames, c60, ww42, kw60, wk60, kk60, bd42)) return false;
-    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42, neutralVcom_, FAST_CDI, 0))
+      return false;
     neutralCount_++;
     return true;
   }
@@ -371,7 +372,7 @@ private:
   // The shared register-partial sequence of NEUTRAL and PAIR (tables already checked by them).
   bool startRegister(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1,
                      const uint8_t *c60, const uint8_t *ww42, const uint8_t *kw60, const uint8_t *wk60,
-                     const uint8_t *kk60, const uint8_t *bd42) {
+                     const uint8_t *kk60, const uint8_t *bd42, uint8_t vcom, uint8_t cdi, uint8_t evs) {
     if (step_ != Step::IDLE || !prev || !frame) return false;
     if (y0 < 0) y0 = 0;
     if (y1 > H) y1 = H;
@@ -381,8 +382,9 @@ private:
     full_ = false; clean_ = false; count_ = true; frame_ = frame; prev_ = prev; y0_ = y0; y1_ = y1;
     xb0_ = xb0; xb1_ = xb1;
     cmd(0x00, {0x3F});                     // PSR: LUT from register, KW mode (as FAST)
-    cmd(0x82, {neutralVcom_});             // N3: VCOM_DC explicit, never more negative than 0x0A
-    cmd(0x50, {FAST_CDI, 0x07});           // border -> LUTBD (level 00 = VCOM: no field), N2OCP=1
+    cmd(0x82, {vcom});                     // N3: VCOM_DC explicit (NEUTRAL/PAIR: never beyond 0x0A)
+    cmd(0x50, {cdi, 0x07});                // NEUTRAL/PAIR: FAST_CDI, border -> LUTBD (zero), N2OCP=1
+    if (evs) cmd(0x52, {evs});             // COPY only: the OTP TR's own end levels
     cmd(0xE0, {0x00});                     // no forced temperature
     cmdData(0x20, c60, 60);
     cmdData(0x21, ww42, 42);
@@ -393,6 +395,7 @@ private:
     regLut_ = true;
     neutral_ = true;
     pair_ = false;
+    copy_ = false;
     powerOn();
     return true;
   }
@@ -442,12 +445,66 @@ public:
                  uint8_t shake = 0) {
     uint8_t c60[60], ww42[42], kw60[60], wk60[60], kk60[60], bd42[42];
     if (!pairTables(frames, shake, c60, ww42, kw60, wk60, kk60, bd42)) return false;
-    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42)) return false;
+    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42, neutralVcom_, FAST_CDI, 0))
+      return false;
     pair_ = true;
     pairCount_++;
     return true;
   }
   bool pairActive() const { return regLut_ && neutral_ && pair_; }
+
+  // OTP COPY (2026-10-01, panel fw 0.3.5; BENCH-SELECTED, never a default). Loads a KW-mode table set
+  // read out of the controller's own OTP (bench dump, 7 groups of 6 bytes each: LUTC, LUTWW, LUTKW,
+  // LUTWK, LUTKK -- the OTP's byte format is the register format) into the register LUTs, so the
+  // factory drive runs byte for byte, with only the caller's VDCS (and, if the caller passes a
+  // modified table, its own change) different. It refuses (sends nothing) unless:
+  //   C1  no phase that runs selects 11b (VDHR / floating) in any table;
+  //   C2  LUTC is VCOM_DC only (level 00): no AC VCOM, no floating;
+  //   C3  every table has LUTC's exact frame/repeat bytes (the tables run in lockstep);
+  //   C4  the drive is at most COPY_MAX_FRAMES frames long;
+  //   C5  VDCS in [COPY_VCOM_MIN, COPY_VCOM_MAX] (-0.60 .. -2.00 V, values this driver already uses);
+  //   C6  CDI is the factory partial's 0x19 (border -> LUTWK, N2OCP, DDX=01) or FAST_CDI 0x39 (border
+  //       -> a zero LUTBD); EVS is 0 (not written), 0x02 (default) or 0x03 (border floats at the end).
+  // Rails (0x01/0x06), frame rate (0x30) and XON (0x2A) are never written: the vendor values after
+  // begin() are the OTP TR's (VDH/VDL 15 V, VG 20 V, 50 Hz, no XON) -- the caller checks its dump.
+  static constexpr uint8_t COPY_VCOM_MIN = FAST_VCOM_MIN, COPY_VCOM_MAX = FAST_VCOM_DC, COPY_MAX_FRAMES = 120;
+  static int copyFrames(const uint8_t *t42) {           // frames until the end condition
+    int n = 0;
+    for (int g = 0; g < 7; g++) {
+      const uint8_t *s = t42 + g * 6;
+      if (!s[5] || !(s[1] | s[2] | s[3] | s[4])) break;
+      n += (s[1] + s[2] + s[3] + s[4]) * s[5];
+    }
+    return n;
+  }
+  static bool copyTablesOk(const uint8_t *c42, const uint8_t *ww42, const uint8_t *kw42, const uint8_t *wk42,
+                           const uint8_t *kk42) {
+    const uint8_t *src[4] = {ww42, kw42, wk42, kk42};
+    if (!c42 || !lutAllZeroLevel(c42, 42)) return false;                         // C2
+    for (const uint8_t *t : src) {
+      if (!t || lutNetFrames(t, 42) == INT32_MIN) return false;                  // C1
+      for (int g = 0; g < 7; g++)
+        for (int i = 1; i <= 5; i++) if (t[g * 6 + i] != c42[g * 6 + i]) return false;   // C3
+    }
+    const int n = copyFrames(c42);
+    return n > 0 && n <= COPY_MAX_FRAMES;                                         // C4
+  }
+  bool startOtpCopy(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1,
+                    const uint8_t *c42, const uint8_t *ww42, const uint8_t *kw42, const uint8_t *wk42,
+                    const uint8_t *kk42, uint8_t vcom, uint8_t cdi = 0x19, uint8_t evs = 0) {
+    if (!copyTablesOk(c42, ww42, kw42, wk42, kk42)) return false;
+    if (vcom < COPY_VCOM_MIN || vcom > COPY_VCOM_MAX) return false;               // C5
+    if ((cdi != 0x19 && cdi != FAST_CDI) || (evs != 0 && evs != 0x02 && evs != 0x03)) return false;   // C6
+    uint8_t c60[60] = {0}, kw60[60] = {0}, wk60[60] = {0}, kk60[60] = {0}, bd42[42] = {0};
+    memcpy(c60, c42, 42); memcpy(kw60, kw42, 42); memcpy(wk60, wk42, 42); memcpy(kk60, kk42, 42);
+    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42, vcom, cdi, evs))
+      return false;
+    copy_ = true;
+    copyCount_++;
+    return true;
+  }
+  bool copyActive() const { return regLut_ && neutral_ && copy_; }
+  uint32_t copyCount() const { return copyCount_; }
   uint32_t pairCount() const { return pairCount_; }
 
   // VDCS for the neutral path only: clamped to 0x00..FAST_VCOM_MIN (-0.10 .. -0.60 V), so it can
@@ -567,6 +624,8 @@ private:
   bool regLut_ = false;       // register LUTs are loaded: the next OTP refresh resets first (S4)
   bool neutral_ = false;      // ... and they are the NEUTRAL or PAIR set (scan follows scanOutside_)
   bool pair_ = false;         // ... the PAIR set
+  bool copy_ = false;         // ... an OTP COPY set
+  uint32_t copyCount_ = 0;
   uint32_t pairCount_ = 0;
   uint8_t neutralVcom_ = FAST_VCOM_MIN;
   uint32_t neutralCount_ = 0;
