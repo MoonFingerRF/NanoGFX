@@ -157,7 +157,7 @@ public:
     if (xb0 < 0) xb0 = 0;
     if (xb1 > rb) xb1 = rb;
     if (y0 >= y1 || xb0 >= xb1) return false;
-    full_ = false; count_ = true; frame_ = frame; prev_ = prev;
+    full_ = false; count_ = true; frame_ = frame; prev_ = prev; pass_ = 0;
     lx0_ = xb0 * 8; lx1_ = xb1 * 8; ly0_ = y0; ly1_ = y1;
     started_ = bus_.millis();
     enter(Step::SEND, 0);
@@ -227,6 +227,13 @@ public:
         // No deep sleep here: a partial cannot wake the controller out of it (see SEND). The high voltages
         // are already off -- both 0x22 sequences end with analog and OSC disabled -- which is what
         // Waveshare's precaution protects the glass from; sleep() remains for a long idle.
+        // MEASURED 2026-10-03 (owner photo): one mode-2 pass (~0.5 s) leaves overwritten strokes visibly dark --
+        // the panel's OTP partial under-drives black -> white. The same update runs again (0x26 is still the old
+        // picture, so the same pixels are driven a second time) until partialPasses() passes are done.
+        if (!full_ && ++pass_ < passes_) {
+          enter(Step::SEND, 0);
+          break;
+        }
         if (!full_) sendWindow(0x26, frame_);    // old := new in the window: 0x26 == the glass again
         finish(now);
         break;
@@ -274,6 +281,9 @@ public:
   uint32_t copyCount() const { return 0; }
   void partialScanOutside(bool on) { scanOutside_ = on; }
   bool partialScanOutside() const { return scanOutside_; }
+  // How many times each partial runs the panel's mode-2 waveform (1 = Waveshare's single pass).
+  void partialPasses(uint8_t n) { passes_ = n < 1 ? 1 : n > 4 ? 4 : n; }
+  uint8_t partialPasses() const { return passes_; }
   void partialTemperature(uint8_t t) { partialTemp_ = t; }
   uint8_t partialTemperature() const { return partialTemp_; }
 
@@ -331,6 +341,8 @@ private:
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
   bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
   uint8_t partialTemp_ = 0x6E;
+  uint8_t passes_ = 2;   // mode-2 passes per partial (see REFRESH_WAIT)
+  uint8_t pass_ = 0;
   Timing timing_{0, 0, 0, 0};
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int lx0_ = 0, lx1_ = PW, ly0_ = 0, ly1_ = PH;
