@@ -10,32 +10,18 @@
 //  here only as refusals (they return false and touch nothing): this controller runs
 //  the panel's own OTP waveforms and nothing else.
 //
-//  WHERE THE REGISTER SEQUENCE COMES FROM (2026-10-02):
-//    * Waveshare's demo for this board (github.com/waveshareteam/ESP32-S3-ePaper-3.97,
-//      ESP-IDF/08_.../components/epaper_port/epaper_port.c): SWRESET 0x12, temperature
-//      sensor 0x18=0x80, booster 0x0C {AE C7 C3 C0 80}, driver output 0x01 {479, 0x02},
-//      full update 0x22=0xF7, partial update 0x22=0xFF, deep sleep 0x10=0x01.
-//    * GxEPD2's GxEPD2_397_GDEM0397T81 (the same 3.97" 800x480 SSD1677 glass): display
-//      update control 0x21 {0x40,0x00} for a full refresh (RED RAM bypassed as 0) and
-//      {0x00,0x00} for a partial (RED RAM = the old picture), partial 0x22=0xFC with the
-//      rails left up, power off 0x22=0x83, and -- the part that makes partials right --
-//      writing the new picture into BOTH RAMs after a partial ("writeImageAgain").
-//
-//  HOW A PARTIAL WORKS ON THIS CONTROLLER, and why it differs from the UC8179: the
-//  SSD1677 refreshes the WHOLE glass every time; "partial" is the OTP mode-2 waveform,
-//  which drives a pixel only where the BW RAM (0x24, new) and the RED RAM (0x26, old)
-//  differ. So the RAM window is only where data is written -- every pixel outside it is
-//  driven by the same-state waveform, and must therefore have old == new. This driver
-//  keeps that invariant: before the refresh it writes the caller's `prev` window to 0x26
-//  and `frame` to 0x24; after BUSY drops it writes `frame` to 0x26 too. A full refresh
-//  writes `frame` to both.
-//
-//  GLASS CARE (the 7.5" panel's greying lessons, satellite/components/nostalgia_panel):
-//  only the vendor's balanced OTP waveforms are used (no register LUTs), the border is
-//  driven by the LUT (0x3C = 0x01, never floated: a floating border drifts grey on a
-//  panel whose rails stay up), the rails come down after a run of updates (powerDown()),
-//  and the full refresh is the caller's to ration (EInkGhost), not a habit.
-//
+//  WHERE THE REGISTER SEQUENCE COMES FROM (2026-10-03, owner: "follow Waveshare's procedures exactly"):
+//  Waveshare's driver for this board (github.com/waveshareteam/ESP32-S3-ePaper-3.97,
+//  Arduino/examples/*/EPD_3in97.cpp), step for step -- the side-by-side audit is in the Nostalgia repo,
+//  satellite/WAVESHARE-AUDIT.md:
+//    * full refresh   = EPD_3IN97_Init (reset, SWRESET 0x12, 0x18 0x80, 0x0C {AE C7 C3 C0 80}, 0x01 {479,
+//      0x02}, 0x3C 0x01, 0x11, window) + EPD_3IN97_Display_Base (the picture into 0x24 AND 0x26) + 0x22 0xF7.
+//    * partial        = EPD_3IN97_Display_Partial (hardware reset, 0x18 0x80, 0x3C 0x80, window, 0x24 only,
+//      0x22 0xFF).
+//    * after either   = deep sleep 0x10 0x01 (Waveshare's precautions: a panel that is not refreshing sleeps).
+//  Only the panel's OTP waveforms, voltages and VCOM are used: no register LUT, no 0x21 RAM bypass, no old-RAM
+//  writes of our own. (The 2026-10-02 register-LUT experiments are in this file's git history.)
+
 //  ROTATION: the controller's RAM is 800 sources (x) by 480 gates (y), and on this glass
 //  the gates are reversed: an upright landscape row y lives at RAM row 479 - y (GxEPD2:
 //  "gates are reversed on this display"). The caller's frame is LOGICAL -- landscape
@@ -62,42 +48,6 @@
 #include <string.h>
 #include <initializer_list>
 
-// A FAST, NON-FLASHING partial waveform for SSD1677 glass (register LUT, command 0x32, the first 105 of the
-// 112 waveform bytes: VS for LUT0-4, TP/RP for groups 0-9, frame rate). Each pixel goes straight to its new
-// state: K->W 20 frames at VSL, W->K 20 frames at VSH1 (a mirror pair: DC-balanced over a there-and-back),
-// unchanged pixels a 1-2 frame same-colour touch-up, VCOM held at DCVCOM. Gate/source voltages and VCOM
-// are written with it (SSD1677_LUT_FAST_DU_VOLTAGES): a partial starts from a hardware reset (see poll()).
-// Source: the vendor DU waveform for an SSD1677 800x480 panel as published in freeink-sdk
-// (github.com/Free-Ink/freeink-sdk, libs/display/FreeInkDisplay/src/lut/Ssd1677Luts.h,
-// lut_fast_metalio; MIT). LUT index = (old bit, new bit), 0 = black: LUT0 KK, LUT1 KW, LUT2 WK, LUT3 WW.
-static const uint8_t SSD1677_LUT_FAST_DU[105] = {
-    0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT0 KK: phases C, D at VSH1
-    0xA8, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT1 KW: A, B, C at VSL
-    0x54, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT2 WK: A, B, C at VSH1
-    0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT3 WW: C at VSL
-    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT4 VCOM: DCVCOM throughout
-    0x03, 0x10, 0x01, 0x01, 0x00,      // group 0: A 3, B 16, C 1, D 1 frames, once
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0x22, 0x22, 0x22, 0x22, 0x22};     // frame rate
-// SSD1677_LUT_FAST_DU with the unchanged pixels left alone (LUT0 KK and LUT3 WW all ground): only pixels that
-// change are driven. MEASURED 2026-10-02 (3.97" glass): the vendor table's 1-2 frame touch-up on unchanged
-// pixels flickers the WHOLE update window -- a volume number changing in a cell reads as the cell (or the
-// page) redrawing -- and it is a small DC bias on static pixels (the 7.5" panel's greying lesson: never
-// drive what does not change). Contrast of static areas is restored by the full cleans.
-static const uint8_t SSD1677_LUT_FAST_QUIET[105] = {
-    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT0 KK: nothing
-    0xA8, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT1 KW: A, B, C at VSL
-    0x54, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT2 WK: A, B, C at VSH1
-    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT3 WW: nothing
-    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT4 VCOM: DCVCOM throughout
-    0x03, 0x10, 0x01, 0x01, 0x00,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0x22, 0x22, 0x22, 0x22, 0x22};
-// The same source's voltages for that waveform: VGH 20 V, VSH1 15 V, VSH2 5 V, VSL -15 V, VCOM code 0x10.
-static const uint8_t SSD1677_LUT_FAST_DU_VOLTAGES[5] = {0x17, 0x41, 0xA8, 0x32, 0x10};
-
 template <class Bus>
 class SSD1677 {
 public:
@@ -120,19 +70,6 @@ public:
   int rowBytes() const { return width() / 8; }
 
   void invert(bool on) { invert_ = on; }
-  // Partials with a register LUT (e.g. SSD1677_LUT_FAST_DU: no flash) instead of the OTP mode-2 sequence.
-  // volt5: VGH, VSH1, VSH2, VSL, VCOM (registers 0x03, 0x04, 0x2C), written with the LUT.
-  // volt5 = nullptr (the default): the panel's own OTP voltages and VCOM.
-  void fastLut(const uint8_t *lut105, const uint8_t *volt5 = nullptr) {
-    fastLut_ = lut105;
-    fastVoltSet_ = volt5 != nullptr;
-    if (volt5) memcpy(fastVolt_, volt5, 5);
-  }
-  bool fastLutActive() const { return fastLut_ != nullptr; }
-  // Every `every`-th fast update runs `lut105` (e.g. SSD1677_LUT_FAST_DU, which also touches unchanged
-  // pixels) instead of the fast LUT. every = 0: never.
-  void fastTouchUp(const uint8_t *lut105, uint8_t every) { touchLut_ = lut105; touchEvery_ = every; }
-
   // Hard reset + register setup. Blocking (~50 ms). Call once, and again after a fault.
   void begin() {
     initRegisters(false);
@@ -142,23 +79,28 @@ public:
   }
 
 private:
-  void hardReset() {
+  // EPD_3IN97_Reset: RST high 20 ms, low 2 ms, high 20 ms.
+  void resetPulse() {
     bus_.reset(true);  bus_.delayMs(20);
     bus_.reset(false); bus_.delayMs(2);
     bus_.reset(true);  bus_.delayMs(20);
-    waitIdle(1000);
   }
-  // Waveshare's EPD_3IN97_Init, with data entry x+/y+ (our windows are in RAM coordinates).
+  // Waveshare's EPD_3IN97_Init, step for step: reset, BUSY, SWRESET, BUSY, 0x18, 0x0C, 0x01, 0x3C 0x01,
+  // 0x11, the whole-RAM window, BUSY. One difference: data entry x+/y+ (0x03, the power-on value) where
+  // Waveshare uses x+/y- (0x01) -- our windows are in RAM coordinates and ramRow() does the mapping, so the
+  // same pixels land in the same RAM cells.
   void initRegisters(bool) {
-    hardReset();
+    resetPulse();
+    waitIdle(1000);
     cmd(0x12);                                   // SWRESET
     bus_.delayMs(10);
     waitIdle(1000);
     cmd(0x18, {0x80});                           // internal temperature sensor
     cmd(0x0C, {0xAE, 0xC7, 0xC3, 0xC0, 0x80});   // booster soft start (vendor)
     cmd(0x01, {(uint8_t) ((PH - 1) & 0xFF), (uint8_t) ((PH - 1) >> 8), 0x02});   // 480 gates
-    cmd(0x3C, {BORDER});                         // border follows the LUT: driven, never floated
+    cmd(0x3C, {BORDER});                         // border waveform (vendor: 0x01)
     cmd(0x11, {0x03});                           // data entry: x+, y+ (windows in RAM coordinates)
+    setWindow(0, PW, 0, PH);
     busyAfterBegin_ = !waitIdle(1000);
   }
 
@@ -221,13 +163,9 @@ public:
     return true;
   }
 
-  // BENCH: set the old (RED) RAM to `glass` without a refresh.
-  bool syncOld(const uint8_t *glass) {
-    if (step_ != Step::IDLE || faulted_ || !glass || bus_.busy()) return false;
-    lx0_ = 0; lx1_ = width(); ly0_ = 0; ly1_ = height();
-    sendWindow(0x26, glass);
-    return true;
-  }
+  // BENCH: refused. Waveshare never writes the old RAM by itself (Display_Base writes both RAMs as part of a
+  // full refresh); neither do we.
+  bool syncOld(const uint8_t *) { return false; }
 
   // Advance the running refresh by at most one step. Cheap when idle or still busy.
   void poll() {
@@ -247,72 +185,38 @@ public:
         const uint32_t t0 = bus_.millis();
         timing_.power = 0;
         if (full_) {
-          initRegisters(true);                   // reset + SWRESET + the vendor's init (EPD_3IN97_Init)
-          sendWindow(0x26, frame_);              // old := new, so the next partial compares to it
+          // EPD_3IN97_Init + EPD_3IN97_Display_Base: the picture into BOTH RAMs (0x24 new, 0x26 old, so
+          // the partials that follow compare against it), then 0x22 0xF7: the panel's OTP full waveform.
+          initRegisters(true);
           sendWindow(0x24, frame_);
-          cmd(0x21, {0x40, 0x00});               // full: RED RAM bypassed as 0
+          sendWindow(0x26, frame_);
           cmd(0x22, {0xF7});                     // clock+analog on, temp, LUT mode 1, display, off
-          if (!powered_) railCycles_++;
         } else {
-          // MEASURED 2026-10-02 (webcam): a mode-2 update issued on the full-refresh register set (0x01
-          // interlaced 480 gates, 0x21) ran its 0.5 s waveform and changed NOTHING on this glass, while
-          // Waveshare's EPD_3IN97_Display_Partial -- hardware reset (registers back to their power-on
-          // values, RAM kept), 0x18 0x80, 0x3C 0x80, window, 0x24, 0x22 0xFF, 0x20 -- drew. So a partial
-          // is exactly that sequence.
-          if (fastLut_) {
-            // MEASURED 2026-10-02 (webcam): a mode-2 update straight after the full-refresh register set
-            // drives nothing on this glass (OTP or register LUT alike); after a hardware reset (registers
-            // back to their power-on values, RAM kept) it draws -- Waveshare's partial does exactly that.
-            hardReset();
-            cmd(0x18, {0x80});
-            cmd(0x11, {0x03});
-            cmd(0x3C, {0x80});                   // border held at VCOM: no ring, no drive
-            // The PANEL'S OWN voltages and VCOM first (owner 2026-10-02: with another panel's VCOM, -0.4 V,
-            // blacks faded to white between updates): load the OTP waveform set for the measured temperature
-            // without displaying (0x22 = 0xB1: clock on, load temperature, load LUT, clock off), then replace
-            // only the waveform bytes. Voltages are written only when fastLut() was given some.
-            cmd(0x22, {0xB1});
-            cmd(0x20);
-            waitIdle(500);
-            // Every touchEvery-th fast update uses the touch-up table instead: unchanged pixels get their
-            // short same-colour pulse, so static black stays black between full cleans.
-            const bool touch = touchLut_ && touchEvery_ && (++fastCount_ % touchEvery_) == 0;
-            cmd(0x32);
-            bus_.data(touch ? touchLut_ : fastLut_, 105);
-            if (fastVoltSet_) {
-              cmd(0x03, {fastVolt_[0]});         // VGH
-              cmd(0x04, {fastVolt_[1], fastVolt_[2], fastVolt_[3]});   // VSH1, VSH2, VSL
-              cmd(0x2C, {fastVolt_[4]});         // VCOM
-            }
-            sendWindow(0x26, prev_);
-            sendWindow(0x24, frame_);
-            cmd(0x22, {0xCF});                   // clock+analog on, display with the REGISTER LUT, off
-          } else {
-            hardReset();
-            cmd(0x18, {0x80});
-            cmd(0x3C, {0x80});
-            cmd(0x11, {0x03});
-            sendWindow(0x26, prev_);             // what is on the glass
-            sendWindow(0x24, frame_);            // what should be
-            cmd(0x22, {0xFF});                   // LUT mode 2, then analog and OSC off
-          }
-          if (!powered_) railCycles_++;
+          // EPD_3IN97_Display_Partial, exactly: hardware reset (no SWRESET, no BUSY wait), 0x18 0x80,
+          // 0x3C 0x80, the window, the new picture into 0x24 ONLY, 0x22 0xFF (OTP mode 2), 0x20. The old
+          // RAM (0x26) is the controller's own business, as in Waveshare's code. 0x11 0x03 is the power-on
+          // value after the reset, written only to say so.
+          resetPulse();
+          cmd(0x18, {0x80});
+          cmd(0x3C, {0x80});
+          cmd(0x11, {0x03});
+          sendWindow(0x24, frame_);
+          cmd(0x22, {0xFF});                     // LUT mode 2, then analog and OSC off
         }
+        railCycles_++;
         cmd(0x20);                               // master activation
         sawBusy_ = false;
         timing_.send = (uint16_t) (bus_.millis() - t0);
-        enter(Step::REFRESH_WAIT, SETTLE_MS);
+        enter(Step::REFRESH_WAIT, BUSY_DELAY_MS);
         break;
       }
       case Step::REFRESH_WAIT:
         timing_.refresh = (uint16_t) (now - stepStart_);
         timing_.off = 0;
         powered_ = false;                        // both sequences end with the analog and OSC off
-        if (!full_) {
-          const uint32_t t0 = bus_.millis();
-          sendWindow(0x26, frame_);              // old := new in the window: old == new everywhere
-          timing_.send = (uint16_t) (timing_.send + (bus_.millis() - t0));
-        }
+        // Waveshare precautions: a panel not refreshing sleeps. Deep sleep mode 1 keeps the RAM; the next
+        // full (Init) and the next partial (Reset) both start with the hardware reset that wakes it.
+        cmd(0x10, {0x01});
         finish(now);
         break;
       case Step::OFF_WAIT:
@@ -410,15 +314,10 @@ private:
   Bus &bus_;
   Step step_ = Step::IDLE;
   static constexpr uint32_t SETTLE_MS = 5;      // BUSY takes a moment to assert after a command
+  static constexpr uint32_t BUSY_DELAY_MS = 100; // EPD_3IN97_ReadBusy waits 100 ms before it looks at BUSY
   static constexpr uint8_t BORDER = 0x01;       // 0x3C: border waveform = LUT1 (driven)
   Rotation rot_ = LANDSCAPE;
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
-  const uint8_t *fastLut_ = nullptr;
-  uint8_t fastVolt_[5] = {0x17, 0x41, 0xA8, 0x32, 0x10};
-  bool fastVoltSet_ = false;
-  const uint8_t *touchLut_ = nullptr;
-  uint8_t touchEvery_ = 0;
-  uint32_t fastCount_ = 0;
   bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
   uint8_t partialTemp_ = 0x6E;
   Timing timing_{0, 0, 0, 0};
@@ -455,13 +354,16 @@ private:
     notBefore_ = stepStart_ + settleMs;
   }
   // Write the current logical window of `src` into RAM `reg` (0x24 new / 0x26 old).
-  void sendWindow(uint8_t reg, const uint8_t *src) {
-    int rx0, rx1, ry0, ry1;
-    ramWindow(lx0_, lx1_, ly0_, ly1_, &rx0, &rx1, &ry0, &ry1);
+  void setWindow(int rx0, int rx1, int ry0, int ry1) {
     cmd(0x44, {(uint8_t) (rx0 & 0xFF), (uint8_t) (rx0 >> 8), (uint8_t) ((rx1 - 1) & 0xFF), (uint8_t) ((rx1 - 1) >> 8)});
     cmd(0x45, {(uint8_t) (ry0 & 0xFF), (uint8_t) (ry0 >> 8), (uint8_t) ((ry1 - 1) & 0xFF), (uint8_t) ((ry1 - 1) >> 8)});
     cmd(0x4E, {(uint8_t) (rx0 & 0xFF), (uint8_t) (rx0 >> 8)});
     cmd(0x4F, {(uint8_t) (ry0 & 0xFF), (uint8_t) (ry0 >> 8)});
+  }
+  void sendWindow(uint8_t reg, const uint8_t *src) {
+    int rx0, rx1, ry0, ry1;
+    ramWindow(lx0_, lx1_, ly0_, ly1_, &rx0, &rx1, &ry0, &ry1);
+    setWindow(rx0, rx1, ry0, ry1);
     cmd(reg);
     const size_t n = (size_t) (rx1 - rx0) / 8;
     size_t fill = 0;

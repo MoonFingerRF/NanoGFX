@@ -22,14 +22,18 @@ struct Sim {
   int busyLeft = 0;
   uint32_t now = 0;
   int refreshes = 0, lastUpdate = -1, lastCtrl = -1;
-  bool wroteOutside = false;
+  bool wroteOutside = false, wroteOld = false, forbidden = false;
+  int lastCmd = -1, swresets = 0;
   int winRx0 = 0, winRx1 = 800, winRy0 = 0, winRy1 = 480;   // the window the test allows
 
   void command(uint8_t c) {
-    cmdReg = c; argN = 0; target = -1;
+    cmdReg = c; argN = 0; target = -1; lastCmd = c;
+    if (c == 0x21 || c == 0x32 || c == 0x03 || c == 0x04 || c == 0x2C || c == 0x37) forbidden = true;
+    if (c == 0x26) wroteOld = true;
     if (c == 0x24) target = 0;
     if (c == 0x26) target = 1;
     if (c == 0x20) { refreshes++; busyLeft = 3; }
+    if (c == 0x12) { swresets++; }
     if (c == 0x12) { xs = 0; xe = 799; ys = 0; ye = 479; xc = yc = 0; }
   }
   void data(const uint8_t *p, size_t n) {
@@ -72,8 +76,8 @@ static void expected(int rot, int lx, int ly, int *rx, int *ry) {
   }
 }
 
-static void run(Sim &, SSD1677<Sim> &d) {
-  for (int i = 0; i < 100 && !d.isIdle(); i++) d.poll();
+static void run(Sim &s, SSD1677<Sim> &d) {
+  for (int i = 0; i < 1000 && !d.isIdle(); i++) { d.poll(); s.now += 10; }
 }
 
 int main() {
@@ -83,8 +87,6 @@ int main() {
     memset(s.ram, 0x55, sizeof s.ram);
     SSD1677<Sim> d(s);
     d.rotation((SSD1677<Sim>::Rotation) rot);
-    const bool fast = rot >= 2;                 // rotations 2/3 run their partials on the register LUT
-    if (fast) d.fastLut(SSD1677_LUT_FAST_DU);
     d.begin();
     const int W = d.width(), H = d.height(), rb = d.rowBytes();
     CHECK((rot & 1) ? (W == 480 && H == 800) : (W == 800 && H == 480), "dims rot %d", rot);
@@ -94,7 +96,8 @@ int main() {
     CHECK(d.startFull(a.data()), "startFull");
     run(s, d);
     CHECK(d.isIdle() && !d.faulted(), "full idle");
-    CHECK(s.lastUpdate == 0xF7 && s.lastCtrl == 0x40, "full update bytes %02X %02X", s.lastUpdate, s.lastCtrl);
+    CHECK(s.lastUpdate == 0xF7 && s.lastCtrl == -1, "full update bytes %02X %02X", s.lastUpdate, s.lastCtrl);
+    CHECK(s.lastCmd == 0x10, "full ends in deep sleep");
     int bad = 0;
     for (int ly = 0; ly < H; ly++)
       for (int lx = 0; lx < W; lx++) {
@@ -116,18 +119,19 @@ int main() {
       int rx0, rx1, ry0, ry1;
       d.ramWindow(xb0 * 8, xb1 * 8, y0, y1, &rx0, &rx1, &ry0, &ry1);
       s.winRx0 = rx0; s.winRx1 = rx1; s.winRy0 = ry0; s.winRy1 = ry1;
-      s.wroteOutside = false;
+      s.wroteOutside = s.wroteOld = false;
+      const int sw = s.swresets;
       d.stayPowered(t & 1);
       CHECK(d.startPartial(b.data(), glass.data(), y0, y1, false, xb0, xb1), "startPartial");
       run(s, d);
       CHECK(!s.wroteOutside, "rot %d partial %d wrote outside its window", rot, t);
-      CHECK(s.lastUpdate == (fast ? 0xCF : 0xFF), "partial update byte");
+      CHECK(s.lastUpdate == 0xFF, "partial update byte");
+      CHECK(!s.wroteOld, "rot %d partial %d wrote the old RAM (Waveshare writes 0x24 only)", rot, t);
+      CHECK(s.swresets == sw, "partial sent SWRESET (Waveshare: hardware reset only)");
+      CHECK(s.lastCmd == 0x10, "partial ends in deep sleep");
       CHECK(!d.powered(), "rails down after a partial");
       glass = b;
-      bad = 0;
-      for (int ry = 0; ry < 480; ry++)
-        for (int x = 0; x < 100; x++) bad += s.ram[0][ry][x] != s.ram[1][ry][x];
-      CHECK(bad == 0, "rot %d partial %d: old != new in %d bytes", rot, t, bad);
+      // the old RAM still holds the base image: the controller, not the driver, owns it after a partial
       bad = 0;
       for (int ly = 0; ly < H; ly++)
         for (int lx = 0; lx < W; lx++) {
@@ -139,6 +143,7 @@ int main() {
     }
     if (d.powered()) { CHECK(d.powerDown(), "powerDown"); run(s, d); }  // never up now
     CHECK(!d.powered() && d.isIdle(), "rails down");
+    CHECK(!s.forbidden, "rot %d: a register LUT / voltage / 0x21 command was sent (OTP only)", rot);
     // the UC8179 bench interface is refused
     CHECK(!d.startFast(a.data(), a.data(), 0, 1, 0, 1, 4) && !d.startNeutral(a.data(), a.data(), 0, 1, 0, 1, 4),
           "bench refused");
