@@ -83,6 +83,8 @@ int main() {
     memset(s.ram, 0x55, sizeof s.ram);
     SSD1677<Sim> d(s);
     d.rotation((SSD1677<Sim>::Rotation) rot);
+    const bool fast = rot >= 2;                 // rotations 2/3 run their partials on the register LUT
+    if (fast) d.fastLut(SSD1677_LUT_FAST_DU);
     d.begin();
     const int W = d.width(), H = d.height(), rb = d.rowBytes();
     CHECK((rot & 1) ? (W == 480 && H == 800) : (W == 800 && H == 480), "dims rot %d", rot);
@@ -119,7 +121,7 @@ int main() {
       CHECK(d.startPartial(b.data(), glass.data(), y0, y1, false, xb0, xb1), "startPartial");
       run(s, d);
       CHECK(!s.wroteOutside, "rot %d partial %d wrote outside its window", rot, t);
-      CHECK(s.lastUpdate == 0xFF, "partial update byte (Waveshare's sequence)");
+      CHECK(s.lastUpdate == (fast ? 0xCF : 0xFF), "partial update byte");
       CHECK(!d.powered(), "rails down after a partial");
       glass = b;
       bad = 0;

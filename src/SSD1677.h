@@ -62,6 +62,25 @@
 #include <string.h>
 #include <initializer_list>
 
+// A FAST, NON-FLASHING partial waveform for SSD1677 glass (register LUT, command 0x32, the first 105 of the
+// 112 waveform bytes: VS for LUT0-4, TP/RP for groups 0-9, frame rate). Each pixel goes straight to its new
+// state: K->W 20 frames at VSL, W->K 20 frames at VSH1 (a mirror pair: DC-balanced over a there-and-back),
+// unchanged pixels a 1-2 frame same-colour touch-up, VCOM held at DCVCOM. Gate/source voltages and VCOM
+// are NOT written: they stay as the panel's own OTP set loaded by the last full refresh.
+// Source: the vendor DU waveform for an SSD1677 800x480 panel as published in freeink-sdk
+// (github.com/Free-Ink/freeink-sdk, libs/display/FreeInkDisplay/src/lut/Ssd1677Luts.h,
+// lut_fast_metalio; MIT). LUT index = (old bit, new bit), 0 = black: LUT0 KK, LUT1 KW, LUT2 WK, LUT3 WW.
+static const uint8_t SSD1677_LUT_FAST_DU[105] = {
+    0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT0 KK: phases C, D at VSH1
+    0xA8, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT1 KW: A, B, C at VSL
+    0x54, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT2 WK: A, B, C at VSH1
+    0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT3 WW: C at VSL
+    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT4 VCOM: DCVCOM throughout
+    0x03, 0x10, 0x01, 0x01, 0x00,      // group 0: A 3, B 16, C 1, D 1 frames, once
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x22, 0x22, 0x22, 0x22, 0x22};     // frame rate
+
 template <class Bus>
 class SSD1677 {
 public:
@@ -84,6 +103,9 @@ public:
   int rowBytes() const { return width() / 8; }
 
   void invert(bool on) { invert_ = on; }
+  // Partials with a register LUT (e.g. SSD1677_LUT_FAST_DU: no flash) instead of the OTP mode-2 sequence.
+  void fastLut(const uint8_t *lut105) { fastLut_ = lut105; }
+  bool fastLutActive() const { return fastLut_ != nullptr; }
 
   // Hard reset + register setup. Blocking (~50 ms). Call once, and again after a fault.
   void begin() {
@@ -211,13 +233,23 @@ public:
           // Waveshare's EPD_3IN97_Display_Partial -- hardware reset (registers back to their power-on
           // values, RAM kept), 0x18 0x80, 0x3C 0x80, window, 0x24, 0x22 0xFF, 0x20 -- drew. So a partial
           // is exactly that sequence.
-          hardReset();
-          cmd(0x18, {0x80});
-          cmd(0x3C, {0x80});
-          cmd(0x11, {0x03});
-          sendWindow(0x26, prev_);               // what is on the glass
-          sendWindow(0x24, frame_);              // what should be
-          cmd(0x22, {0xFF});                     // LUT mode 2, then analog and OSC off
+          if (fastLut_) {                        // register LUT (fastLut): no reset, the OTP voltages stay
+            cmd(0x21, {0x00, 0x00});             // RED RAM = old: LUT index (old, new)
+            cmd(0x3C, {0x80});                   // border held at VCOM: no ring, no drive
+            cmd(0x32);
+            bus_.data(fastLut_, 105);
+            sendWindow(0x26, prev_);
+            sendWindow(0x24, frame_);
+            cmd(0x22, {0xCF});                   // clock+analog on, display with the REGISTER LUT, off
+          } else {
+            hardReset();
+            cmd(0x18, {0x80});
+            cmd(0x3C, {0x80});
+            cmd(0x11, {0x03});
+            sendWindow(0x26, prev_);             // what is on the glass
+            sendWindow(0x24, frame_);            // what should be
+            cmd(0x22, {0xFF});                   // LUT mode 2, then analog and OSC off
+          }
           if (!powered_) railCycles_++;
         }
         cmd(0x20);                               // master activation
@@ -335,6 +367,7 @@ private:
   static constexpr uint8_t BORDER = 0x01;       // 0x3C: border waveform = LUT1 (driven)
   Rotation rot_ = LANDSCAPE;
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
+  const uint8_t *fastLut_ = nullptr;
   bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
   uint8_t partialTemp_ = 0x6E;
   Timing timing_{0, 0, 0, 0};
