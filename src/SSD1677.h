@@ -66,7 +66,7 @@
 // 112 waveform bytes: VS for LUT0-4, TP/RP for groups 0-9, frame rate). Each pixel goes straight to its new
 // state: K->W 20 frames at VSL, W->K 20 frames at VSH1 (a mirror pair: DC-balanced over a there-and-back),
 // unchanged pixels a 1-2 frame same-colour touch-up, VCOM held at DCVCOM. Gate/source voltages and VCOM
-// are NOT written: they stay as the panel's own OTP set loaded by the last full refresh.
+// are written with it (SSD1677_LUT_FAST_DU_VOLTAGES): a partial starts from a hardware reset (see poll()).
 // Source: the vendor DU waveform for an SSD1677 800x480 panel as published in freeink-sdk
 // (github.com/Free-Ink/freeink-sdk, libs/display/FreeInkDisplay/src/lut/Ssd1677Luts.h,
 // lut_fast_metalio; MIT). LUT index = (old bit, new bit), 0 = black: LUT0 KK, LUT1 KW, LUT2 WK, LUT3 WW.
@@ -80,6 +80,8 @@ static const uint8_t SSD1677_LUT_FAST_DU[105] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0x22, 0x22, 0x22, 0x22, 0x22};     // frame rate
+// The same source's voltages for that waveform: VGH 20 V, VSH1 15 V, VSH2 5 V, VSL -15 V, VCOM code 0x10.
+static const uint8_t SSD1677_LUT_FAST_DU_VOLTAGES[5] = {0x17, 0x41, 0xA8, 0x32, 0x10};
 
 template <class Bus>
 class SSD1677 {
@@ -104,7 +106,11 @@ public:
 
   void invert(bool on) { invert_ = on; }
   // Partials with a register LUT (e.g. SSD1677_LUT_FAST_DU: no flash) instead of the OTP mode-2 sequence.
-  void fastLut(const uint8_t *lut105) { fastLut_ = lut105; }
+  // volt5: VGH, VSH1, VSH2, VSL, VCOM (registers 0x03, 0x04, 0x2C), written with the LUT.
+  void fastLut(const uint8_t *lut105, const uint8_t *volt5 = SSD1677_LUT_FAST_DU_VOLTAGES) {
+    fastLut_ = lut105;
+    if (volt5) memcpy(fastVolt_, volt5, 5);
+  }
   bool fastLutActive() const { return fastLut_ != nullptr; }
 
   // Hard reset + register setup. Blocking (~50 ms). Call once, and again after a fault.
@@ -233,11 +239,19 @@ public:
           // Waveshare's EPD_3IN97_Display_Partial -- hardware reset (registers back to their power-on
           // values, RAM kept), 0x18 0x80, 0x3C 0x80, window, 0x24, 0x22 0xFF, 0x20 -- drew. So a partial
           // is exactly that sequence.
-          if (fastLut_) {                        // register LUT (fastLut): no reset, the OTP voltages stay
-            cmd(0x21, {0x00, 0x00});             // RED RAM = old: LUT index (old, new)
+          if (fastLut_) {
+            // MEASURED 2026-10-02 (webcam): a mode-2 update straight after the full-refresh register set
+            // drives nothing on this glass (OTP or register LUT alike); after a hardware reset (registers
+            // back to their power-on values, RAM kept) it draws -- Waveshare's partial does exactly that.
+            hardReset();
+            cmd(0x18, {0x80});
+            cmd(0x11, {0x03});
             cmd(0x3C, {0x80});                   // border held at VCOM: no ring, no drive
             cmd(0x32);
             bus_.data(fastLut_, 105);
+            cmd(0x03, {fastVolt_[0]});           // VGH
+            cmd(0x04, {fastVolt_[1], fastVolt_[2], fastVolt_[3]});   // VSH1, VSH2, VSL
+            cmd(0x2C, {fastVolt_[4]});           // VCOM
             sendWindow(0x26, prev_);
             sendWindow(0x24, frame_);
             cmd(0x22, {0xCF});                   // clock+analog on, display with the REGISTER LUT, off
@@ -368,6 +382,7 @@ private:
   Rotation rot_ = LANDSCAPE;
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
   const uint8_t *fastLut_ = nullptr;
+  uint8_t fastVolt_[5] = {0x17, 0x41, 0xA8, 0x32, 0x10};
   bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
   uint8_t partialTemp_ = 0x6E;
   Timing timing_{0, 0, 0, 0};
