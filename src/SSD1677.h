@@ -227,19 +227,34 @@ public:
         // No deep sleep here: a partial cannot wake the controller out of it (see SEND). The high voltages
         // are already off -- both 0x22 sequences end with analog and OSC disabled -- which is what
         // Waveshare's precaution protects the glass from; sleep() remains for a long idle.
-        // MEASURED 2026-10-03 (owner photo): one mode-2 pass (~0.5 s) leaves overwritten strokes visibly dark --
-        // the panel's OTP partial under-drives black -> white. The same update runs again (0x26 is still the old
-        // picture, so the same pixels are driven a second time) until partialPasses() passes are done.
-        // The repeat touches nothing else -- no reset, no RAM writes, just the same activation on the RAM as it
-        // stands: re-sending the reset and both RAMs between passes flipped the WHOLE glass to an older frame on
-        // the rocker (owner 2026-10-03).
+        // MEASURED 2026-10-03 (owner photos): one mode-2 pass (~0.5 s) leaves overwritten strokes visibly dark --
+        // the panel's OTP partial under-drives black -> white -- so each partial runs partialPasses() times.
+        // What the controller does with its two RAMs after a mode-2 update is not documented and the glass says
+        // it is not "leave them alone": a bare re-activation drove nothing (old := new happened), and a second
+        // pass that rewrote only the window flipped the WHOLE glass to an older frame. So a repeat pass rewrites
+        // BOTH RAMs over the whole frame (0x26 := the glass before, 0x24 := the new picture) whatever state they
+        // were left in, and after the last pass both RAMs := the new picture, the whole frame: every update ends
+        // with RAM == glass everywhere.
         if (!full_ && ++pass_ < passes_) {
+          wholeFrame(true);
+          resetPulse();
+          cmd(0x18, {0x80});
+          cmd(0x3C, {0x80});
+          cmd(0x11, {0x03});
+          sendWindow(0x26, prev_);
+          sendWindow(0x24, frame_);
+          wholeFrame(false);
           cmd(0x22, {0xFF});
           cmd(0x20);
           enter(Step::REFRESH_WAIT, BUSY_DELAY_MS);
           break;
         }
-        if (!full_) sendWindow(0x26, frame_);    // old := new in the window: 0x26 == the glass again
+        if (!full_) {
+          wholeFrame(true);
+          sendWindow(0x26, frame_);
+          sendWindow(0x24, frame_);
+          wholeFrame(false);
+        }
         finish(now);
         break;
       case Step::OFF_WAIT:
@@ -351,6 +366,12 @@ private:
   Timing timing_{0, 0, 0, 0};
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int lx0_ = 0, lx1_ = PW, ly0_ = 0, ly1_ = PH;
+  int sx0_ = 0, sx1_ = PW, sy0_ = 0, sy1_ = PH;   // the update's own window while wholeFrame(true)
+  // sendWindow() over the whole logical frame (true), then back to the update's window (false).
+  void wholeFrame(bool on) {
+    if (on) { sx0_ = lx0_; sx1_ = lx1_; sy0_ = ly0_; sy1_ = ly1_; lx0_ = 0; lx1_ = width(); ly0_ = 0; ly1_ = height(); }
+    else { lx0_ = sx0_; lx1_ = sx1_; ly0_ = sy0_; ly1_ = sy1_; }
+  }
   uint32_t notBefore_ = 0, stepStart_ = 0, started_ = 0, lastMs_ = 0, partials_ = 0, railCycles_ = 0;
   uint8_t line_[PROW * 10];
 
