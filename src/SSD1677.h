@@ -230,8 +230,13 @@ public:
         // MEASURED 2026-10-03 (owner photo): one mode-2 pass (~0.5 s) leaves overwritten strokes visibly dark --
         // the panel's OTP partial under-drives black -> white. The same update runs again (0x26 is still the old
         // picture, so the same pixels are driven a second time) until partialPasses() passes are done.
+        // The repeat touches nothing else -- no reset, no RAM writes, just the same activation on the RAM as it
+        // stands: re-sending the reset and both RAMs between passes flipped the WHOLE glass to an older frame on
+        // the rocker (owner 2026-10-03).
         if (!full_ && ++pass_ < passes_) {
-          enter(Step::SEND, 0);
+          cmd(0x22, {0xFF});
+          cmd(0x20);
+          enter(Step::REFRESH_WAIT, BUSY_DELAY_MS);
           break;
         }
         if (!full_) sendWindow(0x26, frame_);    // old := new in the window: 0x26 == the glass again
