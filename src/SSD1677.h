@@ -99,7 +99,7 @@ public:
     cmd(0x01, {(uint8_t) ((PH - 1) & 0xFF), (uint8_t) ((PH - 1) >> 8), 0x02});   // 480 gates
     cmd(0x3C, {BORDER});                         // border follows the LUT: driven, never floated
     cmd(0x11, {0x03});                           // data entry: x+, y+ (windows in RAM coordinates)
-    waitIdle(1000);
+    busyAfterBegin_ = !waitIdle(1000);
     step_ = Step::IDLE;
     faulted_ = false;
     powered_ = false;
@@ -113,6 +113,11 @@ public:
   uint32_t lastRefreshMs() const { return lastMs_; }
   const Timing &lastTiming() const { return timing_; }
   uint32_t railCycles() const { return railCycles_; }
+  // Whether BUSY was seen high during the last refresh: a refresh that never raised BUSY did not run
+  // (a controller asleep or not answering looks exactly like a very fast one otherwise).
+  bool sawBusy() const { return sawBusy_; }
+  // BUSY right after the last begin()'s SWRESET wait (true = still busy: the wait timed out).
+  bool busyAfterBegin() const { return busyAfterBegin_; }
 
   void stayPowered(bool on) { stay_ = on; }
   bool powered() const { return powered_; }
@@ -171,6 +176,7 @@ public:
     const uint32_t now = bus_.millis();
     if ((int32_t) (now - notBefore_) < 0) return;
     if (bus_.busy()) {
+      if (step_ == Step::REFRESH_WAIT) sawBusy_ = true;
       if (now - stepStart_ > BUSY_TIMEOUT_MS) {
         faulted_ = true;
         step_ = Step::IDLE;
@@ -195,6 +201,7 @@ public:
           if (!powered_) railCycles_++;
         }
         cmd(0x20);                               // master activation
+        sawBusy_ = false;
         timing_.send = (uint16_t) (bus_.millis() - t0);
         enter(Step::REFRESH_WAIT, SETTLE_MS);
         break;
@@ -308,7 +315,7 @@ private:
   static constexpr uint8_t BORDER = 0x01;       // 0x3C: border waveform = LUT1 (driven)
   Rotation rot_ = LANDSCAPE;
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
-  bool stay_ = false, powered_ = false, scanOutside_ = true;
+  bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
   uint8_t partialTemp_ = 0x6E;
   Timing timing_{0, 0, 0, 0};
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
