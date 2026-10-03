@@ -80,6 +80,21 @@ static const uint8_t SSD1677_LUT_FAST_DU[105] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0x22, 0x22, 0x22, 0x22, 0x22};     // frame rate
+// SSD1677_LUT_FAST_DU with the unchanged pixels left alone (LUT0 KK and LUT3 WW all ground): only pixels that
+// change are driven. MEASURED 2026-10-02 (3.97" glass): the vendor table's 1-2 frame touch-up on unchanged
+// pixels flickers the WHOLE update window -- a volume number changing in a cell reads as the cell (or the
+// page) redrawing -- and it is a small DC bias on static pixels (the 7.5" panel's greying lesson: never
+// drive what does not change). Contrast of static areas is restored by the full cleans.
+static const uint8_t SSD1677_LUT_FAST_QUIET[105] = {
+    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT0 KK: nothing
+    0xA8, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT1 KW: A, B, C at VSL
+    0x54, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT2 WK: A, B, C at VSH1
+    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT3 WW: nothing
+    0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // LUT4 VCOM: DCVCOM throughout
+    0x03, 0x10, 0x01, 0x01, 0x00,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x22, 0x22, 0x22, 0x22, 0x22};
 // The same source's voltages for that waveform: VGH 20 V, VSH1 15 V, VSH2 5 V, VSL -15 V, VCOM code 0x10.
 static const uint8_t SSD1677_LUT_FAST_DU_VOLTAGES[5] = {0x17, 0x41, 0xA8, 0x32, 0x10};
 
