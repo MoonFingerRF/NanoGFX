@@ -122,11 +122,16 @@ public:
   void invert(bool on) { invert_ = on; }
   // Partials with a register LUT (e.g. SSD1677_LUT_FAST_DU: no flash) instead of the OTP mode-2 sequence.
   // volt5: VGH, VSH1, VSH2, VSL, VCOM (registers 0x03, 0x04, 0x2C), written with the LUT.
-  void fastLut(const uint8_t *lut105, const uint8_t *volt5 = SSD1677_LUT_FAST_DU_VOLTAGES) {
+  // volt5 = nullptr (the default): the panel's own OTP voltages and VCOM.
+  void fastLut(const uint8_t *lut105, const uint8_t *volt5 = nullptr) {
     fastLut_ = lut105;
+    fastVoltSet_ = volt5 != nullptr;
     if (volt5) memcpy(fastVolt_, volt5, 5);
   }
   bool fastLutActive() const { return fastLut_ != nullptr; }
+  // Every `every`-th fast update runs `lut105` (e.g. SSD1677_LUT_FAST_DU, which also touches unchanged
+  // pixels) instead of the fast LUT. every = 0: never.
+  void fastTouchUp(const uint8_t *lut105, uint8_t every) { touchLut_ = lut105; touchEvery_ = every; }
 
   // Hard reset + register setup. Blocking (~50 ms). Call once, and again after a fault.
   void begin() {
@@ -262,11 +267,23 @@ public:
             cmd(0x18, {0x80});
             cmd(0x11, {0x03});
             cmd(0x3C, {0x80});                   // border held at VCOM: no ring, no drive
+            // The PANEL'S OWN voltages and VCOM first (owner 2026-10-02: with another panel's VCOM, -0.4 V,
+            // blacks faded to white between updates): load the OTP waveform set for the measured temperature
+            // without displaying (0x22 = 0xB1: clock on, load temperature, load LUT, clock off), then replace
+            // only the waveform bytes. Voltages are written only when fastLut() was given some.
+            cmd(0x22, {0xB1});
+            cmd(0x20);
+            waitIdle(500);
+            // Every touchEvery-th fast update uses the touch-up table instead: unchanged pixels get their
+            // short same-colour pulse, so static black stays black between full cleans.
+            const bool touch = touchLut_ && touchEvery_ && (++fastCount_ % touchEvery_) == 0;
             cmd(0x32);
-            bus_.data(fastLut_, 105);
-            cmd(0x03, {fastVolt_[0]});           // VGH
-            cmd(0x04, {fastVolt_[1], fastVolt_[2], fastVolt_[3]});   // VSH1, VSH2, VSL
-            cmd(0x2C, {fastVolt_[4]});           // VCOM
+            bus_.data(touch ? touchLut_ : fastLut_, 105);
+            if (fastVoltSet_) {
+              cmd(0x03, {fastVolt_[0]});         // VGH
+              cmd(0x04, {fastVolt_[1], fastVolt_[2], fastVolt_[3]});   // VSH1, VSH2, VSL
+              cmd(0x2C, {fastVolt_[4]});         // VCOM
+            }
             sendWindow(0x26, prev_);
             sendWindow(0x24, frame_);
             cmd(0x22, {0xCF});                   // clock+analog on, display with the REGISTER LUT, off
@@ -398,6 +415,10 @@ private:
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
   const uint8_t *fastLut_ = nullptr;
   uint8_t fastVolt_[5] = {0x17, 0x41, 0xA8, 0x32, 0x10};
+  bool fastVoltSet_ = false;
+  const uint8_t *touchLut_ = nullptr;
+  uint8_t touchEvery_ = 0;
+  uint32_t fastCount_ = 0;
   bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
   uint8_t partialTemp_ = 0x6E;
   Timing timing_{0, 0, 0, 0};
