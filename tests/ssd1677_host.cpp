@@ -15,6 +15,7 @@ static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 struct Sim {
+  uint8_t glass[480][100];      // what the glass shows: mode 1 (0xF7) copies 0x24, mode 2 (0xFF) drives old != new
   uint8_t ram[2][480][100];     // [0] = 0x24 BW (new), [1] = 0x26 RED (old)
   int xs = 0, xe = 799, ys = 0, ye = 479, xc = 0, yc = 0;
   int cmdReg = -1, argN = 0, target = -1;
@@ -32,7 +33,15 @@ struct Sim {
     if (c == 0x26) wroteOld = true;
     if (c == 0x24) target = 0;
     if (c == 0x26) target = 1;
-    if (c == 0x20) { refreshes++; busyLeft = 3; }
+    if (c == 0x20) {
+      refreshes++; busyLeft = 3;
+      for (int y = 0; y < 480; y++)
+        for (int x = 0; x < 100; x++) {
+          if (lastUpdate == 0xF7) glass[y][x] = ram[0][y][x];
+          else if (lastUpdate == 0xFF)   // only bits where old and new differ are driven, to new
+            glass[y][x] = (uint8_t) ((glass[y][x] & ~(ram[0][y][x] ^ ram[1][y][x])) | (ram[0][y][x] & (ram[0][y][x] ^ ram[1][y][x])));
+        }
+    }
     if (c == 0x12) { swresets++; }
     if (c == 0x12) { xs = 0; xe = 799; ys = 0; ye = 479; xc = yc = 0; }
   }
@@ -126,9 +135,9 @@ int main() {
       run(s, d);
       CHECK(!s.wroteOutside, "rot %d partial %d wrote outside its window", rot, t);
       CHECK(s.lastUpdate == 0xFF, "partial update byte");
-      CHECK(!s.wroteOld, "rot %d partial %d wrote the old RAM (Waveshare writes 0x24 only)", rot, t);
       CHECK(s.swresets == sw, "partial sent SWRESET (Waveshare: hardware reset only)");
-      CHECK(s.lastCmd == 0x20, "partial ends at its activation (no deep sleep)");
+      CHECK(s.wroteOld, "rot %d partial %d: the old RAM was not kept equal to the glass", rot, t);
+      CHECK(s.lastCmd != 0x10, "partial ends without deep sleep");
       CHECK(!d.powered(), "rails down after a partial");
       glass = b;
       // the old RAM still holds the base image: the controller, not the driver, owns it after a partial
@@ -140,10 +149,35 @@ int main() {
           bad += ramBit(s, 0, rx, ry) != !frameBit(glass, rb, lx, ly);
         }
       CHECK(bad == 0, "rot %d partial %d: %d wrong bits", rot, t, bad);
+      bad = 0;   // the GLASS model: every bit that changed was driven, both ways, across successive partials
+      for (int ly = 0; ly < H; ly++)
+        for (int lx = 0; lx < W; lx++) {
+          int rx, ry;
+          expected(rot, lx, ly, &rx, &ry);
+          bad += ((s.glass[ry][rx / 8] >> (7 - (rx & 7))) & 1) != !frameBit(glass, rb, lx, ly);
+        }
+      CHECK(bad == 0, "rot %d partial %d: %d glass bits not driven", rot, t, bad);
     }
     if (d.powered()) { CHECK(d.powerDown(), "powerDown"); run(s, d); }  // never up now
     CHECK(!d.powered() && d.isIdle(), "rails down");
     CHECK(!s.forbidden, "rot %d: a register LUT / voltage / 0x21 command was sent (OTP only)", rot);
+    // THE ERASE BUG (owner 2026-10-03): white page, partial draws a black block, a second partial takes it
+    // back to white -- the second must drive those pixels (black -> white), not see white -> white.
+    {
+      std::vector<uint8_t> w((size_t) rb * H, 0), k = w;
+      for (int y = 10; y < 30; y++) for (int x = 2; x < 6; x++) k[(size_t) y * rb + x] = 0xFF;
+      CHECK(d.startFull(w.data()), "erase: full"); run(s, d);
+      CHECK(d.startPartial(k.data(), w.data(), 10, 30, false, 2, 6), "erase: draw"); run(s, d);
+      CHECK(d.startPartial(w.data(), k.data(), 10, 30, false, 2, 6), "erase: un-draw"); run(s, d);
+      int left = 0;
+      for (int ly = 0; ly < H; ly++)
+        for (int lx = 0; lx < W; lx++) {
+          int rx, ry;
+          expected(rot, lx, ly, &rx, &ry);
+          left += !((s.glass[ry][rx / 8] >> (7 - (rx & 7))) & 1);
+        }
+      CHECK(left == 0, "rot %d erase: %d black pixels left on the glass", rot, left);
+    }
     // the UC8179 bench interface is refused
     CHECK(!d.startFast(a.data(), a.data(), 0, 1, 0, 1, 4) && !d.startNeutral(a.data(), a.data(), 0, 1, 0, 1, 4),
           "bench refused");

@@ -193,17 +193,24 @@ public:
           sendWindow(0x26, frame_);
           cmd(0x22, {0xF7});                     // clock+analog on, temp, LUT mode 1, display, off
         } else {
-          // EPD_3IN97_Display_Partial, exactly: hardware reset (no SWRESET, no BUSY wait), 0x18 0x80,
-          // 0x3C 0x80, the window, the new picture into 0x24 ONLY, 0x22 0xFF (OTP mode 2), 0x20. The old
-          // RAM (0x26) is the controller's own business, as in Waveshare's code. 0x11 0x03 is the power-on
-          // value after the reset, written only to say so. It needs an AWAKE controller, as in Waveshare's
-          // demo (partials back to back, sleep only when done): out of deep sleep this reset leaves BUSY
-          // high for good (measured 2026-10-03, every partial hit the 15 s timeout), so we do not sleep.
+          // EPD_3IN97_Display_Partial (hardware reset, no SWRESET, 0x18 0x80, 0x3C 0x80, window, 0x22 0xFF), with
+          // ONE addition Waveshare's demo never needs because it never un-draws: the old RAM. Mode 2 drives a
+          // pixel only where 0x26 (old) and 0x24 (new) differ, so 0x26 must hold what is ON THE GLASS. Left at
+          // the last full's picture, a pixel blackened by an earlier partial and now going back to white reads
+          // white -> white and is never driven (owner 2026-10-03: overwritten text left black bits behind).
+          // So: 0x26 := prev (the glass) in the window BEFORE activation -- the comparison is made at
+          // activation, so this is the write that decides the drive, whether or not the controller copies
+          // 0x24 into 0x26 afterwards -- and 0x26 := new in the window after BUSY drops, so 0x26 == 0x24 ==
+          // the glass everywhere between updates (nothing outside a window is ever driven). 0x11 0x03 is the
+          // power-on value after the reset, written only to say so. It needs an AWAKE controller, as in
+          // Waveshare's demo: out of deep sleep this reset leaves BUSY high for good (measured 2026-10-03,
+          // every partial hit the 15 s timeout), so we do not sleep.
           resetPulse();
           cmd(0x18, {0x80});
           cmd(0x3C, {0x80});
           cmd(0x11, {0x03});
-          sendWindow(0x24, frame_);
+          sendWindow(0x26, prev_);               // what is on the glass
+          sendWindow(0x24, frame_);              // what should be
           cmd(0x22, {0xFF});                     // LUT mode 2, then analog and OSC off
         }
         railCycles_++;
@@ -220,6 +227,7 @@ public:
         // No deep sleep here: a partial cannot wake the controller out of it (see SEND). The high voltages
         // are already off -- both 0x22 sequences end with analog and OSC disabled -- which is what
         // Waveshare's precaution protects the glass from; sleep() remains for a long idle.
+        if (!full_) sendWindow(0x26, frame_);    // old := new in the window: 0x26 == the glass again
         finish(now);
         break;
       case Step::OFF_WAIT:
