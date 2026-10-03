@@ -97,7 +97,7 @@ int main() {
     run(s, d);
     CHECK(d.isIdle() && !d.faulted(), "full idle");
     CHECK(s.lastUpdate == 0xF7 && s.lastCtrl == -1, "full update bytes %02X %02X", s.lastUpdate, s.lastCtrl);
-    CHECK(s.lastCmd == 0x10, "full ends in deep sleep");
+    CHECK(s.lastCmd == 0x20, "full ends at its activation (no deep sleep: partials need an awake controller)");
     int bad = 0;
     for (int ly = 0; ly < H; ly++)
       for (int lx = 0; lx < W; lx++) {
@@ -128,7 +128,7 @@ int main() {
       CHECK(s.lastUpdate == 0xFF, "partial update byte");
       CHECK(!s.wroteOld, "rot %d partial %d wrote the old RAM (Waveshare writes 0x24 only)", rot, t);
       CHECK(s.swresets == sw, "partial sent SWRESET (Waveshare: hardware reset only)");
-      CHECK(s.lastCmd == 0x10, "partial ends in deep sleep");
+      CHECK(s.lastCmd == 0x20, "partial ends at its activation (no deep sleep)");
       CHECK(!d.powered(), "rails down after a partial");
       glass = b;
       // the old RAM still holds the base image: the controller, not the driver, owns it after a partial

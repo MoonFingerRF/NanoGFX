@@ -18,7 +18,8 @@
 //      0x02}, 0x3C 0x01, 0x11, window) + EPD_3IN97_Display_Base (the picture into 0x24 AND 0x26) + 0x22 0xF7.
 //    * partial        = EPD_3IN97_Display_Partial (hardware reset, 0x18 0x80, 0x3C 0x80, window, 0x24 only,
 //      0x22 0xFF).
-//    * after either   = deep sleep 0x10 0x01 (Waveshare's precautions: a panel that is not refreshing sleeps).
+//    * after either   = no deep sleep: the 0x22 sequences end with the high voltages off, and a partial needs an
+//      awake controller (Waveshare runs its partials back to back); sleep() is there for a long idle.
 //  Only the panel's OTP waveforms, voltages and VCOM are used: no register LUT, no 0x21 RAM bypass, no old-RAM
 //  writes of our own. (The 2026-10-02 register-LUT experiments are in this file's git history.)
 
@@ -195,7 +196,9 @@ public:
           // EPD_3IN97_Display_Partial, exactly: hardware reset (no SWRESET, no BUSY wait), 0x18 0x80,
           // 0x3C 0x80, the window, the new picture into 0x24 ONLY, 0x22 0xFF (OTP mode 2), 0x20. The old
           // RAM (0x26) is the controller's own business, as in Waveshare's code. 0x11 0x03 is the power-on
-          // value after the reset, written only to say so.
+          // value after the reset, written only to say so. It needs an AWAKE controller, as in Waveshare's
+          // demo (partials back to back, sleep only when done): out of deep sleep this reset leaves BUSY
+          // high for good (measured 2026-10-03, every partial hit the 15 s timeout), so we do not sleep.
           resetPulse();
           cmd(0x18, {0x80});
           cmd(0x3C, {0x80});
@@ -214,9 +217,9 @@ public:
         timing_.refresh = (uint16_t) (now - stepStart_);
         timing_.off = 0;
         powered_ = false;                        // both sequences end with the analog and OSC off
-        // Waveshare precautions: a panel not refreshing sleeps. Deep sleep mode 1 keeps the RAM; the next
-        // full (Init) and the next partial (Reset) both start with the hardware reset that wakes it.
-        cmd(0x10, {0x01});
+        // No deep sleep here: a partial cannot wake the controller out of it (see SEND). The high voltages
+        // are already off -- both 0x22 sequences end with analog and OSC disabled -- which is what
+        // Waveshare's precaution protects the glass from; sleep() remains for a long idle.
         finish(now);
         break;
       case Step::OFF_WAIT:
