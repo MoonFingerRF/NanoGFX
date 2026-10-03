@@ -87,10 +87,22 @@ public:
 
   // Hard reset + register setup. Blocking (~50 ms). Call once, and again after a fault.
   void begin() {
+    initRegisters(false);
+    step_ = Step::IDLE;
+    faulted_ = false;
+    powered_ = false;
+  }
+
+private:
+  void hardReset() {
     bus_.reset(true);  bus_.delayMs(20);
     bus_.reset(false); bus_.delayMs(2);
     bus_.reset(true);  bus_.delayMs(20);
     waitIdle(1000);
+  }
+  // Waveshare's EPD_3IN97_Init, with data entry x+/y+ (our windows are in RAM coordinates).
+  void initRegisters(bool) {
+    hardReset();
     cmd(0x12);                                   // SWRESET
     bus_.delayMs(10);
     waitIdle(1000);
@@ -100,10 +112,9 @@ public:
     cmd(0x3C, {BORDER});                         // border follows the LUT: driven, never floated
     cmd(0x11, {0x03});                           // data entry: x+, y+ (windows in RAM coordinates)
     busyAfterBegin_ = !waitIdle(1000);
-    step_ = Step::IDLE;
-    faulted_ = false;
-    powered_ = false;
   }
+
+public:
 
   bool isIdle() const { return step_ == Step::IDLE; }
   Step step() const { return step_; }
@@ -188,16 +199,25 @@ public:
         const uint32_t t0 = bus_.millis();
         timing_.power = 0;
         if (full_) {
+          initRegisters(true);                   // reset + SWRESET + the vendor's init (EPD_3IN97_Init)
           sendWindow(0x26, frame_);              // old := new, so the next partial compares to it
           sendWindow(0x24, frame_);
           cmd(0x21, {0x40, 0x00});               // full: RED RAM bypassed as 0
           cmd(0x22, {0xF7});                     // clock+analog on, temp, LUT mode 1, display, off
           if (!powered_) railCycles_++;
         } else {
+          // MEASURED 2026-10-02 (webcam): a mode-2 update issued on the full-refresh register set (0x01
+          // interlaced 480 gates, 0x21) ran its 0.5 s waveform and changed NOTHING on this glass, while
+          // Waveshare's EPD_3IN97_Display_Partial -- hardware reset (registers back to their power-on
+          // values, RAM kept), 0x18 0x80, 0x3C 0x80, window, 0x24, 0x22 0xFF, 0x20 -- drew. So a partial
+          // is exactly that sequence.
+          hardReset();
+          cmd(0x18, {0x80});
+          cmd(0x3C, {0x80});
+          cmd(0x11, {0x03});
           sendWindow(0x26, prev_);               // what is on the glass
           sendWindow(0x24, frame_);              // what should be
-          cmd(0x21, {0x00, 0x00});               // RED RAM normal: the mode-2 differential
-          cmd(0x22, {(uint8_t) (stay_ ? 0xFC : 0xFF)});   // LUT mode 2; 0xFF also powers down
+          cmd(0x22, {0xFF});                     // LUT mode 2, then analog and OSC off
           if (!powered_) railCycles_++;
         }
         cmd(0x20);                               // master activation
@@ -209,7 +229,7 @@ public:
       case Step::REFRESH_WAIT:
         timing_.refresh = (uint16_t) (now - stepStart_);
         timing_.off = 0;
-        powered_ = !full_ && stay_;
+        powered_ = false;                        // both sequences end with the analog and OSC off
         if (!full_) {
           const uint32_t t0 = bus_.millis();
           sendWindow(0x26, frame_);              // old := new in the window: old == new everywhere

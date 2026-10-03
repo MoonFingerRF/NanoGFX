@@ -119,8 +119,8 @@ int main() {
       CHECK(d.startPartial(b.data(), glass.data(), y0, y1, false, xb0, xb1), "startPartial");
       run(s, d);
       CHECK(!s.wroteOutside, "rot %d partial %d wrote outside its window", rot, t);
-      CHECK(s.lastCtrl == 0x00 && s.lastUpdate == ((t & 1) ? 0xFC : 0xFF), "partial update bytes");
-      CHECK(d.powered() == (bool) (t & 1), "powered after partial");
+      CHECK(s.lastUpdate == 0xFF, "partial update byte (Waveshare's sequence)");
+      CHECK(!d.powered(), "rails down after a partial");
       glass = b;
       bad = 0;
       for (int ry = 0; ry < 480; ry++)
@@ -135,7 +135,7 @@ int main() {
         }
       CHECK(bad == 0, "rot %d partial %d: %d wrong bits", rot, t, bad);
     }
-    if (d.powered()) { CHECK(d.powerDown(), "powerDown"); run(s, d); }
+    if (d.powered()) { CHECK(d.powerDown(), "powerDown"); run(s, d); }  // never up now
     CHECK(!d.powered() && d.isIdle(), "rails down");
     // the UC8179 bench interface is refused
     CHECK(!d.startFast(a.data(), a.data(), 0, 1, 0, 1, 4) && !d.startNeutral(a.data(), a.data(), 0, 1, 0, 1, 4),
