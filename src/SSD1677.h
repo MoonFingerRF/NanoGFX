@@ -278,6 +278,11 @@ public:
     }
   }
 
+  // UNPROVEN ON THE GLASS (field result 2026-10-04, the 3.97" voice panel): after sleep() the woken partial below
+  // still hit the 15 s BUSY timeout -- the same failure as a bare reset on 2026-10-03 -- so the Nostalgia panel no
+  // longer calls it. Waveshare's own EPD_Sleep also switches the panel's rail (the PMU's ALDO3) off, and their
+  // EPD_Init switches it on before the reset: a power cycle this driver cannot do and has never tried. Bench it
+  // with that before using sleep() anywhere.
   // Deep sleep (0x10 0x01): ~1 uA typ (SSD1677 datasheet DC table, Idslp_VCI) instead of the idle controller with
   // its oscillator stopped. Only when idle. The next startFull()/startPartial() wakes it (EPD_3IN97_Init first,
   // ~65 ms blocking inside poll()); nothing else may talk to it in between. Returns whether it went to sleep.
