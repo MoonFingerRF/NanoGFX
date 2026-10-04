@@ -18,8 +18,13 @@
 //      0x02}, 0x3C 0x01, 0x11, window) + EPD_3IN97_Display_Base (the picture into 0x24 AND 0x26) + 0x22 0xF7.
 //    * partial        = EPD_3IN97_Display_Partial (hardware reset, 0x18 0x80, 0x3C 0x80, window, 0x24 only,
 //      0x22 0xFF).
-//    * after either   = no deep sleep: the 0x22 sequences end with the high voltages off, and a partial needs an
-//      awake controller (Waveshare runs its partials back to back); sleep() is there for a long idle.
+//    * after either   = no deep sleep by default: the 0x22 sequences end with the high voltages off. sleep() puts
+//      the controller in deep sleep (0x10 0x01) for a long idle -- the caller's choice (the voice panel's battery
+//      mode) -- and the NEXT update wakes it the way Waveshare's demo does (ESP-IDF 08_*/main/main.cc: EPD_Sleep
+//      after 60 s idle, then EPD_Init before EPD_Display_Partial): the whole EPD_3IN97_Init (reset, BUSY, SWRESET,
+//      BUSY, registers) before the partial's own reset. A bare reset alone does not wake it for a partial (measured
+//      2026-10-03: BUSY stayed high, every partial hit the timeout). Our partial rewrites the old RAM (0x26 := the
+//      glass) itself, so nothing depends on what deep sleep kept in RAM.
 //  Only the panel's OTP waveforms, voltages and VCOM are used: no register LUT, no 0x21 RAM bypass, no old-RAM
 //  writes of our own. (The 2026-10-02 register-LUT experiments are in this file's git history.)
 
@@ -77,6 +82,7 @@ public:
     step_ = Step::IDLE;
     faulted_ = false;
     powered_ = false;
+    asleep_ = false;
   }
 
 private:
@@ -103,6 +109,7 @@ private:
     cmd(0x11, {0x03});                           // data entry: x+, y+ (windows in RAM coordinates)
     setWindow(0, PW, 0, PH);
     busyAfterBegin_ = !waitIdle(1000);
+    asleep_ = false;                             // EPD_3IN97_Init is also the wake from deep sleep
   }
 
 public:
@@ -205,6 +212,10 @@ public:
           // power-on value after the reset, written only to say so. It needs an AWAKE controller, as in
           // Waveshare's demo: out of deep sleep this reset leaves BUSY high for good (measured 2026-10-03,
           // every partial hit the 15 s timeout), so we do not sleep.
+          if (asleep_) {                         // out of deep sleep: Waveshare's wake, EPD_Init, first
+            initRegisters(true);
+            wakes_++;
+          }
           resetPulse();
           cmd(0x18, {0x80});
           cmd(0x3C, {0x80});
@@ -267,12 +278,20 @@ public:
     }
   }
 
-  // Deep sleep: lowest power; needs begin() to wake. Only when idle.
-  void sleep() {
-    if (step_ != Step::IDLE) return;
+  // Deep sleep (0x10 0x01): ~1 uA typ (SSD1677 datasheet DC table, Idslp_VCI) instead of the idle controller with
+  // its oscillator stopped. Only when idle. The next startFull()/startPartial() wakes it (EPD_3IN97_Init first,
+  // ~65 ms blocking inside poll()); nothing else may talk to it in between. Returns whether it went to sleep.
+  bool sleep() {
+    if (step_ != Step::IDLE || asleep_ || faulted_) return false;
     cmd(0x10, {0x01});
     powered_ = false;
+    asleep_ = true;
+    sleeps_++;
+    return true;
   }
+  bool asleep() const { return asleep_; }
+  uint32_t sleeps() const { return sleeps_; }
+  uint32_t wakes() const { return wakes_; }
 
   // ---- the UC8179's bench interface, refused (see the header) ---------------------------------
   bool startFast(const uint8_t *, const uint8_t *, int, int, int, int, uint8_t) { return false; }
@@ -360,6 +379,8 @@ private:
   Rotation rot_ = LANDSCAPE;
   bool full_ = true, count_ = false, faulted_ = false, invert_ = false;
   bool stay_ = false, powered_ = false, scanOutside_ = true, sawBusy_ = false, busyAfterBegin_ = false;
+  bool asleep_ = false;
+  uint32_t sleeps_ = 0, wakes_ = 0;
   uint8_t partialTemp_ = 0x6E;
   uint8_t passes_ = 2;   // mode-2 passes per partial (see REFRESH_WAIT)
   uint8_t pass_ = 0;
