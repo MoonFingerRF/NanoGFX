@@ -174,7 +174,29 @@ class Panel {
     gpio_set_level((gpio_num_t) pins_.cs, 1);
   }
 
-  // Select a window and start shifting `n` bytes (the window's, page by page) out by DMA.
+  // How a PARTIAL window's columns reach the RAM the full-frame addressing reads (the RLCD-4.2 with
+  // Waveshare's MADCTL 0x48, measured 2026-10-06: units u0..u1 land at 24-u1..24-u0, pages as given).
+  // 0 = as given, 1 = units mirrored, 2 = mirrored + the units of each page sent in reverse, 3 = mirrored +
+  // the bytes of each page sent in reverse. The self-test finds the exact one (Panel::windowMode).
+  void setWindowMode(int m) { window_mode_ = m & 3; }
+  int windowMode() const { return window_mode_; }
+  // Lay out a window's bytes (gathered page by page, as ST7305Pack.h gather() makes them) for the wire, in
+  // place, for this window mode: modes 2 and 3 reverse each page's run.
+  void prepare(const Window &w, uint8_t *bytes) const {
+    if (w.empty() || window_mode_ < 2 || (w.u0 == 0 && w.u1 == UNITS - 1)) return;
+    const int run = (w.u1 - w.u0 + 1) * UNIT_BYTES;
+    for (int p = 0; p <= w.p1 - w.p0; p++) {
+      uint8_t *r = bytes + p * run;
+      if (window_mode_ == 3) {
+        for (int i = 0, j = run - 1; i < j; i++, j--) { const uint8_t t = r[i]; r[i] = r[j]; r[j] = t; }
+      } else {
+        for (int i = 0, j = run - UNIT_BYTES; i < j; i += UNIT_BYTES, j -= UNIT_BYTES)
+          for (int k = 0; k < UNIT_BYTES; k++) { const uint8_t t = r[i + k]; r[i + k] = r[j + k]; r[j + k] = t; }
+      }
+    }
+  }
+
+  // Select a window and start shifting `n` bytes (the window's, page by page, already prepare()d) out by DMA.
   void writeStart(const Window &w, const uint8_t *bytes, size_t n) {
     writeWait();
     setWindow_(w);
@@ -325,7 +347,9 @@ class Panel {
     spi_device_polling_transmit(wr_, &t);
   }
   void setWindow_(const Window &w) {
-    cmd(0x2A, {(uint8_t) (XS0 + w.u0), (uint8_t) (XS0 + w.u1)});
+    int u0 = w.u0, u1 = w.u1;
+    if (window_mode_ != 0) { u0 = UNITS - 1 - w.u1; u1 = UNITS - 1 - w.u0; }
+    cmd(0x2A, {(uint8_t) (XS0 + u0), (uint8_t) (XS0 + u1)});
     cmd(0x2B, {(uint8_t) (YS0 + w.p0), (uint8_t) (YS0 + w.p1)});
   }
   void finish_() {
@@ -341,6 +365,7 @@ class Panel {
   bool pending_ = false;
   uint8_t *rxbuf_ = nullptr;
   int read_skip_ = 1;
+  int window_mode_ = 1;
   Tuning tuning_{};
   SemaphoreHandle_t te_sem_ = nullptr;
   volatile uint32_t te_count_ = 0;
