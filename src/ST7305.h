@@ -50,15 +50,59 @@ struct Pins {
   int dc, cs, sck, mosi, rst, te;   // rst/te < 0 = not wired
 };
 
-// The analogue and timing settings that differ between Waveshare's own builds (datasheet 8.2).
+// The analogue and timing settings that differ between builds for this glass (datasheet 8.2). Defaults are
+// Waveshare's LVGL demo values at the glass's full rate; see the presets for the other known builds.
+//
+// WHY BLACK CAN READ GREY (2026-10-06, the owner: "darks not as dark as the demo"): every pixel is charged once
+// a frame through its TFT while that line's gate is at VGH. Gate EQ (B3h) cuts each line's update period into
+// 16 PWM steps and says which voltage the gate sits at in each; Waveshare's (= the datasheet default) holds VGH
+// for only 9 of 16, stepping through AVDD/GND/NAVDD on both sides. Waveshare's factory program scans at 16 Hz,
+// so each line gets ~3.3x the time it gets at our 51 Hz; at 51 Hz the pixel does not reach the source voltage
+// and black stays grey whatever VSHP/VSHN say. u8g2's driver for this 300x400 glass notes Waveshare's gate EQ
+// "has lower contrast" and holds VGH for 14 of 16 steps (GEQ_LONG), with VGH 17 V / VGL -10 V (C0h 12h 0Ah).
+enum GateEq : uint8_t {
+  GEQ_WAVESHARE = 0,   // F NAVDD GND AVDD, VGH x9, AVDD GND NAVDD   (datasheet default, Waveshare's demos)
+  GEQ_LONG = 1,        // VGL, VGH x14, VGL                          (u8g2's 300x400 sequence: "higher contrast")
+  GEQ_MID = 2,         // F NAVDD, VGH x11, AVDD GND NAVDD           (Waveshare's ramps kept, 11 on instead of 9)
+  GEQ_COUNT = 3
+};
+inline const uint8_t *gateEqParams(uint8_t preset) {   // B3h parameters 3..10 (16 PWM steps, 2 per byte)
+  static const uint8_t P[GEQ_COUNT][8] = {
+      {0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45},
+      {0x17, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x71},
+      {0x05, 0x77, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45},
+  };
+  return P[preset < GEQ_COUNT ? preset : 0];
+}
+
 struct Tuning {
   uint8_t vshp = 0x69, vslp = 0x19, vshn = 0x4B, vsln = 0x19;   // C1h C2h C4h C5h source voltages
+  uint8_t vgh = 0x11, vgl = 0x04;   // C0h: VGH = 8.0 + 0.5 x vgh V (<= 0x12, 17 V), VGL = -(5.0 + 0.5 x vgl) V
+  uint8_t geq = GEQ_WAVESHARE;      // B3h gate EQ in HPM (GateEq)
+  uint8_t pnlset = 0x29;            // B8h: 1-dot inversion, frame-interval gate scan, one-line interlace (the only
+                                    // scan word this glass shows right, measured 2026-10-06)
   bool osc51 = true;     // D8h OSCSW 000: the 51 Hz family (false: 32 Hz family)
   bool full_rate = true; // B2h HFRA: 51 / 32 Hz (false: 25.5 / 16 Hz)
   uint8_t lpm_rate = 2;  // B2h LFRA, Low Power Mode: 0.25 0.5 1 2 4 8 Hz for 0..5
   static Tuning waveshareLvgl() { Tuning t; t.full_rate = false; return t; }        // 25.5 Hz
   static Tuning waveshareFactory() {                                                // 16 Hz, lower drive
     Tuning t; t.vshp = 0x41; t.vshn = 0x41; t.osc51 = false; t.full_rate = false; t.lpm_rate = 5; return t;
+  }
+  // u8g2's 300x400 sequence (olikraus/u8g2 u8x8_d_st7305.c, "adjusted to the panel maker's sample code"): 32 Hz
+  static Tuning u8g2() {
+    Tuning t; t.vshp = 0x3C; t.vslp = 0x23; t.vshn = 0x5A; t.vsln = 0x37; t.vgh = 0x12; t.vgl = 0x0A;
+    t.geq = GEQ_LONG; t.osc51 = false; t.full_rate = true; t.lpm_rate = 2; return t;
+  }
+  // Clamp to the datasheet's ranges: VGH 8..17 V, VGL -6..-15 V (so VGH - VGL <= 32 V), sources +3.7..6.2 V
+  // and -2.5..-5.2 V ("usable" tables), LFRA 0..5.
+  void clamp() {
+    if (vgh > 0x12) vgh = 0x12;
+    if (vgl < 0x02) vgl = 0x02;
+    if (vgl > 0x14) vgl = 0x14;
+    if (vshp > 0x7D) vshp = 0x7D;
+    if (vshn > 0x87) vshn = 0x87;
+    if (geq >= GEQ_COUNT) geq = GEQ_WAVESHARE;
+    if (lpm_rate > 5) lpm_rate = 5;
   }
   float hpmHz() const { return osc51 ? (full_rate ? 51.0f : 25.5f) : (full_rate ? 32.0f : 16.0f); }
 };
@@ -105,8 +149,11 @@ class Panel {
   }
   uint32_t writeClock() const { return actual_hz_; }
 
-  // Hardware reset + Waveshare's init (their display_bsp.cpp, with the tuning above), display on, HPM.
-  void init(const Tuning &t) {
+  // Hardware reset + Waveshare's init (their display_bsp.cpp, with the tuning above), display on, HPM. Calling it
+  // again re-applies a whole tuning in the datasheet's order (the RAM is cleared by the reset: rewrite the frame).
+  void init(const Tuning &tuning) {
+    Tuning t = tuning;
+    t.clamp();
     tuning_ = t;
     if (pins_.rst >= 0) {
       gpio_set_level((gpio_num_t) pins_.rst, 1);
@@ -118,14 +165,17 @@ class Panel {
     }
     cmd(0xD6, {0x17, 0x02});                         // NVM load control
     cmd(0xD1, {0x01});                               // booster on
-    cmd(0xC0, {0x11, 0x04});                         // gate voltage
+    cmd(0xC0, {t.vgh, t.vgl});                       // gate voltage
     cmd(0xC1, {t.vshp, t.vshp, t.vshp, t.vshp});     // source voltages
     cmd(0xC2, {t.vslp, t.vslp, t.vslp, t.vslp});
     cmd(0xC4, {t.vshn, t.vshn, t.vshn, t.vshn});
     cmd(0xC5, {t.vsln, t.vsln, t.vsln, t.vsln});
     cmd(0xD8, {(uint8_t) (t.osc51 ? 0x80 : 0xA6), 0xE9});   // OSCSET
     cmd(0xB2, {frctrl_(t)});                         // FRCTRL
-    cmd(0xB3, {0xE5, 0xF6, 0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45});   // gate EQ, HPM
+    {
+      const uint8_t *g = gateEqParams(t.geq);        // gate EQ, HPM
+      cmd(0xB3, {0xE5, 0xF6, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]});
+    }
     cmd(0xB4, {0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45});               // gate EQ, LPM
     cmd(0x62, {0x32, 0x03, 0x1F});                   // gate timing
     cmd(0xB7, {0x13});                               // source EQ
@@ -136,7 +186,7 @@ class Panel {
     cmd(0x36, {0x48});                               // MADCTL
     cmd(0x3A, {0x11});                               // data format: 1 bit
     cmd(0xB9, {0x20});                               // gamma mode: mono
-    cmd(0xB8, {0x29});                               // panel setting
+    cmd(0xB8, {t.pnlset});                           // panel setting
     cmd(0x21);                                       // inversion on: a 0 bit is black (ST7305Pack writes ink as 0)
     cmd(0x35, {0x00});                               // TE on, V-blank only
     cmd(0xD0, {0xFF});                               // auto power down off
