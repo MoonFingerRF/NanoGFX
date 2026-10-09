@@ -459,7 +459,7 @@ public:
   // factory drive runs byte for byte, with only the caller's VDCS (and, if the caller passes a
   // modified table, its own change) different. It refuses (sends nothing) unless:
   //   C1  no phase that runs selects 11b (VDHR / floating) in any table;
-  //   C2  LUTC is VCOM_DC only (level 00): no AC VCOM, no floating;
+  //   C2  LUTC is VCOM_DC only (level 00): no AC VCOM, no floating (the caller's table; floatVcom below);
   //   C3  every table has LUTC's exact frame/repeat bytes (the tables run in lockstep);
   //   C4  the drive is at most COPY_MAX_FRAMES frames long;
   //   C5  VDCS in [COPY_VCOM_MIN, COPY_VCOM_MAX] (-0.10 .. -2.00 V; 0x00 = controller floor, owner-approved bench 2026-10-02);
@@ -489,22 +489,59 @@ public:
     const int n = copyFrames(c42);
     return n > 0 && n <= COPY_MAX_FRAMES;                                         // C4
   }
+  // FLOATING VCOM (2026-10-09, panel fw 0.3.11 experiment; owner-approved). The caller's LUTC must
+  // still pass C2 (VCOM_DC only); `floatVcom` then sends the same table with every running group's
+  // level byte set to 11b on all four phases (datasheet p.42/p.44: "the driver will float VCOM"), so
+  // the common electrode floats for the whole drive instead of sitting at VDCS. The frame/repeat
+  // bytes are untouched, so C3 lockstep still holds. Never a mix: either every running group of LUTC
+  // floats, or none does (floatLutc / lutAllFloatLevel). Research S8 (2026-09-23) kept 11b out of
+  // production on a drift model (a floating refresh inherits the previous path's rest state), not a
+  // hazard; this is the controlled test of that, behind the panel's own persisted switch.
+  static void floatLutc(const uint8_t *c42, uint8_t *out42) {
+    memcpy(out42, c42, 42);
+    for (int g = 0; g < 7; g++) {
+      uint8_t *s = out42 + g * 6;
+      if (!s[5] || !(s[1] | s[2] | s[3] | s[4])) break;     // the end condition, as copyFrames
+      s[0] = 0xFF;
+    }
+  }
+  // True when every running group of a 42-byte LUTC selects 11b on every phase that has frames.
+  static bool lutAllFloatLevel(const uint8_t *t42) {
+    bool any = false;
+    for (int g = 0; g < 7; g++) {
+      const uint8_t *s = t42 + g * 6;
+      if (!s[5] || !(s[1] | s[2] | s[3] | s[4])) break;
+      for (int ph = 0; ph < 4; ph++)
+        if (s[1 + ph] && ((s[0] >> (6 - 2 * ph)) & 3) != 3) return false;
+      any = true;
+    }
+    return any;
+  }
   bool startOtpCopy(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1,
                     const uint8_t *c42, const uint8_t *ww42, const uint8_t *kw42, const uint8_t *wk42,
-                    const uint8_t *kk42, uint8_t vcom, uint8_t cdi = 0x19, uint8_t evs = 0) {
+                    const uint8_t *kk42, uint8_t vcom, uint8_t cdi = 0x19, uint8_t evs = 0,
+                    bool floatVcom = false) {
     if (!copyTablesOk(c42, ww42, kw42, wk42, kk42)) return false;
     if (vcom < COPY_VCOM_MIN || vcom > COPY_VCOM_MAX) return false;               // C5
     if ((cdi != 0x19 && cdi != FAST_CDI) || (evs != 0 && evs != 0x02 && evs != 0x03)) return false;   // C6
     uint8_t c60[60] = {0}, kw60[60] = {0}, wk60[60] = {0}, kk60[60] = {0}, bd42[42] = {0};
-    memcpy(c60, c42, 42); memcpy(kw60, kw42, 42); memcpy(wk60, wk42, 42); memcpy(kk60, kk42, 42);
+    if (floatVcom) {
+      floatLutc(c42, c60);
+      if (!lutAllFloatLevel(c60)) return false;
+    } else {
+      memcpy(c60, c42, 42);
+    }
+    memcpy(kw60, kw42, 42); memcpy(wk60, wk42, 42); memcpy(kk60, kk42, 42);
     if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42, vcom, cdi, evs))
       return false;
     copy_ = true;
     copyCount_++;
+    if (floatVcom) copyFloatCount_++;
     return true;
   }
   bool copyActive() const { return regLut_ && neutral_ && copy_; }
   uint32_t copyCount() const { return copyCount_; }
+  uint32_t copyFloatCount() const { return copyFloatCount_; }
   uint32_t pairCount() const { return pairCount_; }
 
   // VDCS for the neutral path only: clamped to 0x00..FAST_VCOM_MIN (-0.10 .. -0.60 V), so it can
@@ -625,7 +662,7 @@ private:
   bool neutral_ = false;      // ... and they are the NEUTRAL or PAIR set (scan follows scanOutside_)
   bool pair_ = false;         // ... the PAIR set
   bool copy_ = false;         // ... an OTP COPY set
-  uint32_t copyCount_ = 0;
+  uint32_t copyCount_ = 0, copyFloatCount_ = 0;
   uint32_t pairCount_ = 0;
   uint8_t neutralVcom_ = FAST_VCOM_MIN;
   uint32_t neutralCount_ = 0;

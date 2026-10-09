@@ -703,6 +703,35 @@ static void test_copy() {
   bus.log.clear();
   CHECK(epd.startPartial(next, prev, 40, 60, false, 3, 11)); complete();
   CHECK(!epd.copyActive() && !epd.fastActive() && bus.log[0].first == 0x02 && *find(0x00) == std::vector<uint8_t>{0x1F});
+  // FLOATING VCOM (0.3.11 experiment): the same table with every running LUTC group at 11b, nothing else
+  {
+    uint8_t f[42];
+    E::floatLutc(c, f);
+    CHECK(f[0] == 0xFF && f[6] == 0xFF && f[12] == 0x00 && E::lutAllFloatLevel(f) && !E::lutAllFloatLevel(c));
+    for (int g = 0; g < 7; g++)
+      for (int i = 1; i <= 5; i++) CHECK(f[g * 6 + i] == c[g * 6 + i]);              // timing untouched
+    uint8_t mixed[42];
+    memcpy(mixed, f, 42); mixed[6] = 0x00;                                             // one group driven
+    CHECK(!E::lutAllFloatLevel(mixed));
+    epd.stayPowered(false);
+    bus.log.clear();
+    const uint32_t floats = epd.copyFloatCount(), copies = epd.copyCount();
+    // the caller's table must still be VCOM_DC only: an AC or pre-floated LUTC is refused, nothing sent
+    uint8_t bad[42];
+    memcpy(bad, c, 42); bad[0] = 0x40;
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, bad, ww, kw, wk, kk, 0x00, 0x19, 0x03, true));
+    CHECK(!epd.startOtpCopy(next, prev, 40, 60, 3, 11, f, ww, kw, wk, kk, 0x00, 0x19, 0x03, true));
+    CHECK(bus.log.empty());
+    CHECK(epd.startOtpCopy(next, prev, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x00, 0x19, 0x03, true));
+    complete();
+    CHECK(*find(0x20) == pad(f, 60) && *find(0x21) == pad(ww, 42) && *find(0x22) == pad(kw, 60));
+    CHECK(*find(0x23) == pad(wk, 60) && *find(0x24) == pad(kk, 60));
+    CHECK(epd.copyFloatCount() == floats + 1 && epd.copyCount() == copies + 1);
+    // without the flag: the driven table, the float count unchanged
+    bus.log.clear();
+    CHECK(epd.startOtpCopy(prev, next, 40, 60, 3, 11, c, ww, kw, wk, kk, 0x00, 0x19, 0x03)); complete();
+    CHECK(*find(0x20) == pad(c, 60) && epd.copyFloatCount() == floats + 1);
+  }
 }
 
 static void test_ghost() {
