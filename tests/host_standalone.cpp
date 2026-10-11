@@ -879,6 +879,67 @@ static void test_fast() {
   CHECK(epd.railCycles() == rails + (epd.powered() ? 0 : 1));
 }
 
+// A full-waveform refresh from registers (startFullCopy, 2026-10-11): the reTerminal glass's TR4
+// full (182 frames, every table net 0) at a chosen VDCS, whole glass or a window.
+static void test_full_copy() {
+  typedef UC8179<SimBus> E;
+  const uint8_t c[42] = {0x00, 0x21, 0x19, 0, 0, 1, 0x00, 0x0A, 0x01, 0x0A, 0x01, 3, 0x00, 0x0A, 0x0A, 0x0A, 0x0A, 1,
+                         0x00, 0x0C, 0x05, 0x01, 0, 1, 0, 0, 0, 0, 0, 1};
+  const uint8_t w[42] = {0x40, 0x21, 0x19, 0, 0, 1, 0x84, 0x0A, 0x01, 0x0A, 0x01, 3, 0x88, 0x0A, 0x0A, 0x0A, 0x0A, 1,
+                         0x88, 0x0C, 0x05, 0x01, 0, 1, 0, 0, 0, 0, 0, 1};
+  const uint8_t k[42] = {0x20, 0x21, 0x19, 0, 0, 1, 0x84, 0x0A, 0x01, 0x0A, 0x01, 3, 0x11, 0x0A, 0x0A, 0x0A, 0x0A, 1,
+                         0x10, 0x0C, 0x05, 0x01, 0, 1, 0, 0, 0, 0, 0, 1};
+  CHECK(E::copyFrames(c) == 182 && E::lutNetFrames(w, 42) == 0 && E::lutNetFrames(k, 42) == 0);
+  SimBus bus;
+  E epd(bus);
+  epd.begin();
+  static uint8_t prev[48000], next[48000];
+  for (size_t i = 0; i < sizeof next; i++) next[i] = (uint8_t) (i * 5);
+  auto complete = [&]() {
+    int guard = 0;
+    while (!epd.isIdle() && guard++ < 5000) { bus.t += 5; epd.poll(); }
+    CHECK(epd.isIdle() && !epd.faulted());
+  };
+  static const std::vector<uint8_t> none(9, 0xEE);
+  auto find = [&](uint8_t cm) -> const std::vector<uint8_t> * {
+    for (auto &e : bus.log) if (e.first == cm) return &e.second;
+    return &none;
+  };
+  // refusals send nothing: an unbalanced table, a table out of step with LUTC, VCOM past -2.00 V, too long
+  bus.log.clear();
+  {
+    uint8_t bad[42];
+    memcpy(bad, w, 42); bad[18] = 0x80;                   // last group loses 1 VDL frame: net +1
+    CHECK(!epd.startFullCopy(next, prev, 0, 480, 0, 100, c, bad, bad, k, k, 0x00, 0x19, 0x03));
+    memcpy(bad, k, 42); bad[19] = 0x0D;                   // timing differs from LUTC
+    CHECK(!epd.startFullCopy(next, prev, 0, 480, 0, 100, c, w, w, bad, bad, 0x00, 0x19, 0x03));
+    CHECK(!epd.startFullCopy(next, prev, 0, 480, 0, 100, c, w, w, k, k, 0x27, 0x19, 0x03));
+    const uint8_t lc[42] = {0x00, 250, 0, 0, 0, 3}, lw[42] = {0x00, 250, 0, 0, 0, 3};   // 750 frames
+    CHECK(!epd.startFullCopy(next, prev, 0, 480, 0, 100, lc, lw, lw, lw, lw, 0x00, 0x19, 0x03));
+  }
+  CHECK(bus.log.empty());
+  // the whole glass at -0.10 V: register tables, VDCS 0x00, the full window, both RAMs
+  epd.stayPowered(false);
+  CHECK(epd.startFullCopy(next, prev, 0, 480, 0, 100, c, w, w, k, k, 0x00, 0x19, 0x03));
+  complete();
+  CHECK(epd.copyActive() && epd.fullCopyCount() == 1);
+  CHECK(*find(0x82) == std::vector<uint8_t>{0x00} && *find(0x00) == std::vector<uint8_t>{0x3F});
+  auto pad = [](const uint8_t *t, size_t n) { std::vector<uint8_t> v(t, t + 42); v.resize(n, 0); return v; };
+  CHECK(*find(0x20) == pad(c, 60) && *find(0x21) == pad(w, 42) && *find(0x22) == pad(w, 60));
+  CHECK(*find(0x23) == pad(k, 60) && *find(0x24) == pad(k, 60));
+  CHECK(*find(0x90) == (std::vector<uint8_t>{0x00, 0x00, 0x03, 0x1F, 0x00, 0x00, 0x01, 0xDF, 0x01}));
+  // the next OTP full leaves the register LUTs first (power off, reset) and runs with cascade off
+  bus.log.clear();
+  CHECK(epd.startFull(next)); complete();
+  CHECK(!epd.copyActive() && !epd.fastActive());
+  CHECK(*find(0xE0) == std::vector<uint8_t>{0x00});
+  // a window (a CLEAN): rows 40..59, bytes 3..10
+  bus.log.clear();
+  CHECK(epd.startFullCopy(next, prev, 40, 60, 3, 11, c, w, w, k, k, 0x0A, 0x19, 0x03)); complete();
+  CHECK(*find(0x82) == std::vector<uint8_t>{0x0A} && (*find(0x90))[0] == 0x00 && (*find(0x90))[1] == 24);
+  CHECK(epd.fullCopyCount() == 2);
+}
+
 int main(int argc, char **argv) {
   test_canvas_and_text();
   test_mono_export();
@@ -892,6 +953,7 @@ int main(int argc, char **argv) {
   test_neutral();
   test_pair();
   test_copy();
+  test_full_copy();
   test_ghost();
   printf(fails ? "host_standalone: %d FAILED\n" : "host_standalone: ok\n", fails);
   return fails ? 1 : 0;

@@ -75,6 +75,14 @@ public:
   // the panel's OWN factory (OTP) waveforms a partial uses: 0x6E is the vendor's fast partial (the
   // default); 0x5A its fast full; others are undocumented bins. No custom LUT is ever loaded here.
   void partialTemperature(uint8_t t) { partialTemp_ = t; }
+
+  // BENCH (2026-10-11 grey-paper hunt): what a FULL refresh writes to OLD RAM (0x10) and which
+  // temperature picks its OTP waveform. KW mode chooses each pixel's waveform from its OLD and NEW
+  // bits. fullOld 0 = nothing, OLD keeps the last partial's frame (the default), 1 = ~NEW,
+  // 2 = NEW. fullTemperature -1 = the internal sensor (the default), else that value forced
+  // through the cascade register 0xE5 (0x5A = the vendor's fast full).
+  void fullOld(uint8_t mode) { fullOld_ = mode > 2 ? 0 : mode; }
+  void fullTemperature(int t) { fullTemp_ = t < 0 ? -1 : t > 255 ? 255 : t; }
   uint8_t partialTemperature() const { return partialTemp_; }
 
   // Hard reset + register setup. Blocking (~300 ms). Call once, and again after a timeout.
@@ -171,7 +179,12 @@ public:
     if (regLut_) leaveFast();              // S4: an OTP refresh starts from the vendor's registers
     full_ = true; clean_ = false; count_ = true; frame_ = frame; prev_ = nullptr; y0_ = 0; y1_ = H;
     xb0_ = 0; xb1_ = ROW;
-    cmd(0xE0, {0x00});                     // cascade off: the real temperature picks the LUT
+    if (fullTemp_ >= 0) {                  // BENCH fullTemperature: a forced temperature bin
+      cmd(0xE0, {0x02});
+      cmd(0xE5, {(uint8_t) fullTemp_});
+    } else {
+      cmd(0xE0, {0x00});                   // cascade off: the real temperature picks the LUT
+    }
     cmd(0x92);                             // leave partial mode, if we were in it
     cmd(0x50, {CDI_FULL, 0x07});           // VCOM/data interval; border driven (see CDI_*)
     if (factoryVcom_ >= 0) cmd(0x82, {(uint8_t) factoryVcom_});   // bench only (factoryVcom)
@@ -539,6 +552,37 @@ public:
     if (floatVcom) copyFloatCount_++;
     return true;
   }
+  // A FULL-waveform refresh through the register LUTs (2026-10-11). An OTP refresh takes VCOM_DC
+  // from the selected TR's own header (datasheet p.48/p.51) whatever R82H holds -- -2.00 V in every
+  // TR of the reTerminal E1001's glass, which nulls near 0 V -- so the full's VCOM can only be chosen
+  // by running the same tables from registers. The caller passes the factory full waveform of the
+  // TR the temperature selects, byte for byte, for the whole glass (a FULL) or a window (a CLEAN).
+  // Gates: the startOtpCopy rules (LUTC at VCOM_DC only, every table in lockstep with it) except the
+  // frame budget, plus every source table DC-balanced (net 0 frames) and at most
+  // FULL_COPY_MAX_FRAMES (the coldest TR runs 480); VDCS 0x00..FAST_VCOM_DC (-0.10 .. -2.00 V).
+  static constexpr int FULL_COPY_MAX_FRAMES = 500;
+  bool startFullCopy(const uint8_t *frame, const uint8_t *prev, int y0, int y1, int xb0, int xb1,
+                     const uint8_t *c42, const uint8_t *ww42, const uint8_t *kw42, const uint8_t *wk42,
+                     const uint8_t *kk42, uint8_t vcom, uint8_t cdi, uint8_t evs) {
+    const uint8_t *src[4] = {ww42, kw42, wk42, kk42};
+    if (!c42 || !lutAllZeroLevel(c42, 42)) return false;
+    for (const uint8_t *t : src) {
+      if (!t || lutNetFrames(t, 42) != 0) return false;
+      for (int g = 0; g < 7; g++)
+        for (int i = 1; i <= 5; i++) if (t[g * 6 + i] != c42[g * 6 + i]) return false;
+    }
+    const int n = copyFrames(c42);
+    if (n <= 0 || n > FULL_COPY_MAX_FRAMES || vcom > FAST_VCOM_DC) return false;
+    if ((cdi != 0x19 && cdi != FAST_CDI) || (evs != 0 && evs != 0x02 && evs != 0x03)) return false;
+    uint8_t c60[60] = {0}, kw60[60] = {0}, wk60[60] = {0}, kk60[60] = {0}, bd42[42] = {0};
+    memcpy(c60, c42, 42); memcpy(kw60, kw42, 42); memcpy(wk60, wk42, 42); memcpy(kk60, kk42, 42);
+    if (!startRegister(frame, prev, y0, y1, xb0, xb1, c60, ww42, kw60, wk60, kk60, bd42, vcom, cdi, evs))
+      return false;
+    copy_ = true;
+    fullCopyCount_++;
+    return true;
+  }
+  uint32_t fullCopyCount() const { return fullCopyCount_; }
   bool copyActive() const { return regLut_ && neutral_ && copy_; }
   uint32_t copyCount() const { return copyCount_; }
   uint32_t copyFloatCount() const { return copyFloatCount_; }
@@ -668,6 +712,9 @@ private:
   uint32_t neutralCount_ = 0;
   uint8_t fastVcom_ = FAST_VCOM_DC, fastVcomTable_ = 0;
   int factoryVcom_ = -1;
+  uint32_t fullCopyCount_ = 0;
+  uint8_t fullOld_ = 0;      // BENCH fullOld()
+  int fullTemp_ = -1;        // BENCH fullTemperature()
   uint32_t railCycles_ = 0;
   const uint8_t *frame_ = nullptr, *prev_ = nullptr;
   int y0_ = 0, y1_ = H;
@@ -734,6 +781,8 @@ private:
   }
   void sendAndRefresh() {
     if (full_) {
+      if (fullOld_ == 1) sendRows(0x10, frame_, !invert_);      // BENCH fullOld: OLD = ~NEW
+      else if (fullOld_ == 2) sendRows(0x10, frame_, invert_);  // BENCH fullOld: OLD = NEW
       sendRows(0x13, frame_, invert_);     // same data polarity as a partial (DDX=01 in both)
     } else {
       cmd(0x91);                           // partial in
