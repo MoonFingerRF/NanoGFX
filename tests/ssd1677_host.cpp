@@ -25,9 +25,15 @@ struct Sim {
   int refreshes = 0, lastUpdate = -1, lastCtrl = -1;
   bool wroteOutside = false, wroteOld = false, forbidden = false;
   int lastCmd = -1, swresets = 0;
+  // DEEP SLEEP (0x10 0x01), as measured on the glass 2026-10-03: a controller woken by a bare hardware reset
+  // runs no update (BUSY stays high for good); EPD_3IN97_Init's SWRESET after the reset is what wakes it.
+  bool asleep = false, resetSinceSleep = false, cmdWhileAsleep = false;
   int winRx0 = 0, winRx1 = 800, winRy0 = 0, winRy1 = 480;   // the window the test allows
 
   void command(uint8_t c) {
+    if (asleep && !resetSinceSleep) cmdWhileAsleep = true;   // it does not listen until reset
+    if (asleep && c == 0x12) asleep = false;                 // the SWRESET after the reset: awake
+    if (asleep && c == 0x20) { busyLeft = 1 << 30; }         // a bare reset: BUSY high for good
     cmdReg = c; argN = 0; target = -1; lastCmd = c;
     if (c == 0x21 || c == 0x32 || c == 0x03 || c == 0x04 || c == 0x2C || c == 0x37) forbidden = true;
     if (c == 0x26) wroteOld = true;
@@ -63,11 +69,12 @@ struct Sim {
       if (cmdReg == 0x4E && argN == 2) xc = args[0] | args[1] << 8;
       if (cmdReg == 0x4F && argN == 2) yc = args[0] | args[1] << 8;
       if (cmdReg == 0x22 && argN == 1) lastUpdate = args[0];
+      if (cmdReg == 0x10 && argN == 1 && (args[0] & 3)) { asleep = true; resetSinceSleep = false; }
       if (cmdReg == 0x21 && argN == 1) lastCtrl = args[0];
     }
   }
   bool busy() { if (busyLeft > 0) { busyLeft--; return true; } return false; }
-  void reset(bool) {}
+  void reset(bool level) { if (!level && asleep) resetSinceSleep = true; }
   void delayMs(uint32_t ms) { now += ms; }
   uint32_t millis() { return now += 1; }
 };
@@ -178,6 +185,34 @@ int main() {
           left += !((s.glass[ry][rx / 8] >> (7 - (rx & 7))) & 1);
         }
       CHECK(left == 0, "rot %d erase: %d black pixels left on the glass", rot, left);
+    }
+    // DEEP SLEEP between updates (battery mode): sleep(), then a partial wakes it with EPD_3IN97_Init first and
+    // draws correctly; a second sleep() is refused while asleep; a partial without a sleep sends no SWRESET.
+    {
+      std::vector<uint8_t> w((size_t) rb * H, 0), k = w;
+      for (int y = 40; y < 80; y++) for (int x = 1; x < 5; x++) k[(size_t) y * rb + x] = 0xF0;
+      CHECK(d.startFull(w.data()), "sleep: full"); run(s, d);
+      CHECK(d.sleep() && d.asleep() && s.asleep && s.lastCmd == 0x10, "sleep: 0x10 sent");
+      CHECK(!d.sleep(), "sleep: refused when already asleep");
+      const int sw = s.swresets, wk = (int) d.wakes();
+      CHECK(d.startPartial(k.data(), w.data(), 40, 80, false, 1, 5), "sleep: partial accepted"); run(s, d);
+      CHECK(d.isIdle() && !d.faulted() && !d.asleep() && !s.asleep, "sleep: woke and finished (faulted %d)", d.faulted());
+      CHECK(s.swresets == sw + 1 && (int) d.wakes() == wk + 1, "sleep: one EPD_Init (SWRESET) for the wake");
+      CHECK(!s.cmdWhileAsleep, "sleep: a command reached the sleeping controller before its reset");
+      int bad = 0;
+      for (int ly = 0; ly < H; ly++)
+        for (int lx = 0; lx < W; lx++) {
+          int rx, ry;
+          expected(rot, lx, ly, &rx, &ry);
+          bad += ((s.glass[ry][rx / 8] >> (7 - (rx & 7))) & 1) != !frameBit(k, rb, lx, ly);
+        }
+      CHECK(bad == 0, "rot %d sleep: %d wrong glass bits after the woken partial", rot, bad);
+      const int sw2 = s.swresets;
+      CHECK(d.startPartial(w.data(), k.data(), 40, 80, false, 1, 5), "awake partial"); run(s, d);
+      CHECK(s.swresets == sw2 && !d.faulted(), "awake partial: no SWRESET");
+      // a full out of deep sleep wakes through its own EPD_Init
+      CHECK(d.sleep(), "sleep again"); CHECK(d.startFull(w.data()), "full from sleep"); run(s, d);
+      CHECK(!d.faulted() && !d.asleep() && !s.asleep, "full from sleep: woke");
     }
     // the UC8179 bench interface is refused
     CHECK(!d.startFast(a.data(), a.data(), 0, 1, 0, 1, 4) && !d.startNeutral(a.data(), a.data(), 0, 1, 0, 1, 4),
