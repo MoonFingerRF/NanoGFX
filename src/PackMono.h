@@ -83,6 +83,42 @@ public:
     }
   }
 
+  // Export only byte columns [xb0, xb1) (8 px each) of canvas rows [y0, y1); every other byte of
+  // `out` is left as it was. For a screen whose unchanged parts were exported before (a ticking
+  // cell redrawn into an otherwise kept canvas): bit-identical to exportRows over that rectangle,
+  // at a fraction of the cost. No mirrorX (a mirrored row maps columns elsewhere: use exportRows).
+  void exportRect(PackCanvas &c, uint8_t *out, int xb0, int xb1, int y0, int y1, bool inkBit = true) {
+    const int W = c.width(), H = c.height(), nb = (int)rowBytes(W);
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (xb0 < 0) xb0 = 0;
+    if (xb1 > nb) xb1 = nb;
+    if (y0 >= y1 || xb0 >= xb1 || (W & 1)) return;
+    c.flatten(y0, y1);
+    const size_t stride = c.lineSlotBytes();
+    const uint8_t *raw = c.rawBuffer();
+    const uint8_t flip = inkBit ? 0x00 : 0xFF;
+    const int full = W >> 3, rem = W & 7;
+    const int fb1 = xb1 < full ? xb1 : full;          // whole output bytes; the tail byte apart
+    for (int y = y0; y < y1; y++) {
+      const uint8_t *src = raw + (size_t)y * stride;
+      uint8_t *dst = out + (size_t)y * (size_t)nb;
+      const uint8_t *l0 = lut[y & 3][0], *l1 = lut[y & 3][1];
+      for (int i = xb0; i < fb1; i++) {
+        const uint8_t *s = src + i * 4;
+        dst[i] = (uint8_t)(((l0[s[0]] << 6) | (l1[s[1]] << 4) | (l0[s[2]] << 2) | l1[s[3]]) ^ flip);
+      }
+      if (rem && xb1 > full) {                        // the tail byte (W not a multiple of 8)
+        uint8_t b = 0;
+        for (int k = 0; k < rem; k += 2) {
+          uint8_t two = ((k >> 1) & 1) ? l1[src[full * 4 + (k >> 1)]] : l0[src[full * 4 + (k >> 1)]];
+          b |= (uint8_t)(two << (6 - k));
+        }
+        dst[full] = (uint8_t)(b ^ (flip & (uint8_t)(0xFF << (8 - rem))));
+      }
+    }
+  }
+
   // The band of rows where frames a and b differ: returns false when they are identical,
   // else [*y0, *y1) covers every differing row.
   static bool diffRows(const uint8_t *a, const uint8_t *b, int w, int h, int *y0, int *y1) {

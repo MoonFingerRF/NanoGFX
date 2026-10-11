@@ -25,6 +25,9 @@
 //    ST7789.h    — 4-wire SPI TFTs, same split-polling shape.
 //    UC8179.h    — 800x480 e-paper (Waveshare 7.5" V2, reTerminal E1001):
 //                  non-blocking full + windowed partial refresh over any bus.
+//    SSD1677.h   — 800x480 e-paper (Waveshare ESP32-S3-ePaper-3.97, GDEM0397T81):
+//                  the same non-blocking shape, OTP partials, logical frame in
+//                  landscape or portrait (rotation mapped while sending).
 //
 //  Battle-tested in NanoPFD (an ESP32-S3 glass cockpit): 450x600 AMOLED at
 //  46-48 fps with WiFi AP + two BLE/WiFi receivers live on the same chip.
